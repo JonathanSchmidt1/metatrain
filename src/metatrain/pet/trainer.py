@@ -436,6 +436,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 "validation_total": 0.0,
             }
             timed_steps = 0
+            batches_with_energy_pos_grad = 0
 
             train_loss = 0.0
             pbar = tqdm(train_dataloader, desc=f"Epoch {epoch}", leave=True)
@@ -468,6 +469,12 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 )
                 sync_timing_cuda()
                 timing_sums["batch_to"] += time.perf_counter() - t0
+                if any(
+                    train_targets[key].quantity == "energy"
+                    and "positions" in train_targets[key].gradients
+                    for key in targets.keys()
+                ):
+                    batches_with_energy_pos_grad += 1
                 autocast_ctx = (
                     torch.autocast(device_type="cuda", dtype=torch.bfloat16)
                     if use_bf16_autocast
@@ -759,7 +766,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                     "(%.1f%%) | train_step=%.2f (%.1f%%) | unpack=%.2f (%.1f%%) | "
                     "batch_to=%.2f (%.1f%%) | forward+loss=%.2f (%.1f%%) | "
                     "backward+opt=%.2f (%.1f%%) | metrics/log=%.2f (%.1f%%) | "
-                    "validation_total=%.2fs",
+                    "validation_total=%.2fs | energy_posgrad_batches=%d/%d",
                     epoch,
                     avg_loop_ms,
                     avg_wait_ms,
@@ -777,6 +784,8 @@ class Trainer(TrainerInterface[TrainerHypers]):
                     avg_metrics_ms,
                     100.0 * timing_sums["metrics_logging"] / denom,
                     timing_sums["validation_total"],
+                    batches_with_energy_pos_grad,
+                    timed_steps,
                 )
 
             if epoch % self.hypers["checkpoint_interval"] == 0:
