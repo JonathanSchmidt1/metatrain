@@ -1104,7 +1104,10 @@ class MemmapDataset(TorchDataset):
                     keys=Labels.single(),
                     blocks=[
                         TensorBlock(
-                            values=torch.tensor([[float(self.charge_array[i])]]),
+                            values=torch.tensor(
+                                [[float(self.charge_array[i])]],
+                                dtype=torch.float64,
+                            ),
                             samples=Labels(
                                 "system", torch.tensor([[i]], dtype=torch.int32)
                             ),
@@ -1121,7 +1124,10 @@ class MemmapDataset(TorchDataset):
                     keys=Labels.single(),
                     blocks=[
                         TensorBlock(
-                            values=torch.tensor([[float(self.spin_array[i])]]),
+                            values=torch.tensor(
+                                [[float(self.spin_array[i])]],
+                                dtype=torch.float64,
+                            ),
                             samples=Labels(
                                 "system", torch.tensor([[i]], dtype=torch.int32)
                             ),
