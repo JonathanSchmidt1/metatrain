@@ -138,9 +138,12 @@ class Trainer(TrainerInterface[TrainerHypers]):
             )
             model_dtype = torch.float32
             batch_dtype = torch.float32
+            precision_mode = "bf16-autocast"
         else:
             model_dtype = dtype
             batch_dtype = dtype
+            precision_mode = str(dtype).replace("torch.", "")
+        logging.info(f"Effective precision mode: {precision_mode}")
 
         # Apply fine-tuning strategy if provided
         if is_finetune:
@@ -270,6 +273,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
         else:
             num_workers = self.hypers["num_workers"]
             validate_num_workers(num_workers)
+        pin_memory = device.type == "cuda"
 
         train_dataloaders = []
         for train_dataset, train_sampler in zip(
@@ -297,6 +301,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                     ),
                     collate_fn=collate_fn_train,
                     num_workers=num_workers,
+                    pin_memory=pin_memory,
                 )
             )
         train_dataloader = CombinedDataLoader(train_dataloaders, shuffle=True)
@@ -313,6 +318,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                     drop_last=False,
                     collate_fn=collate_fn_val,
                     num_workers=num_workers,
+                    pin_memory=pin_memory,
                 )
             )
         val_dataloader = CombinedDataLoader(val_dataloaders, shuffle=False)
