@@ -400,7 +400,8 @@ class Trainer(TrainerInterface[TrainerHypers]):
         use_sync_cuda_timing = profile_step_timing_sync_cuda and device.type == "cuda"
         if profile_step_timing:
             logging.info(
-                "Step timing profiler enabled (training-loop stage breakdown per epoch)."
+                "Step timing profiler enabled "
+                "(training-loop stage breakdown per epoch)."
             )
             if profile_step_timing_sync_cuda and device.type != "cuda":
                 logging.warning(
@@ -751,7 +752,9 @@ class Trainer(TrainerInterface[TrainerHypers]):
                     train_loss = 0.0
 
             if profile_step_timing and timed_steps > 0 and rank == 0:
-                loop_total = timing_sums["train_step_total"] + timing_sums["dataloader_wait"]
+                loop_total = (
+                    timing_sums["train_step_total"] + timing_sums["dataloader_wait"]
+                )
                 avg_step_ms = 1000.0 * timing_sums["train_step_total"] / timed_steps
                 avg_wait_ms = 1000.0 * timing_sums["dataloader_wait"] / timed_steps
                 avg_loop_ms = 1000.0 * loop_total / timed_steps
@@ -762,7 +765,8 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 avg_metrics_ms = 1000.0 * timing_sums["metrics_logging"] / timed_steps
                 denom = max(loop_total, 1e-12)
                 logging.info(
-                    "Epoch %d timing (avg/step ms): loop_total=%.2f | dataloader_wait=%.2f "
+                    "Epoch %d timing (avg/step ms): loop_total=%.2f "
+                    "| dataloader_wait=%.2f "
                     "(%.1f%%) | train_step=%.2f (%.1f%%) | unpack=%.2f (%.1f%%) | "
                     "batch_to=%.2f (%.1f%%) | forward+loss=%.2f (%.1f%%) | "
                     "backward+opt=%.2f (%.1f%%) | metrics/log=%.2f (%.1f%%) | "
