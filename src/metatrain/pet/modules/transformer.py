@@ -515,6 +515,7 @@ class CartesianTransformer(torch.nn.Module):
                 initial_num_tokens - max_num_tokens,
                 output_edge_embeddings.shape[2],
                 device=output_edge_embeddings.device,
+                dtype=output_edge_embeddings.dtype,
             )
             output_edge_embeddings = torch.cat([output_edge_embeddings, padding], dim=1)
         output_node_embeddings = output_node_embeddings.squeeze(1)

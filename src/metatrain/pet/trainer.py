@@ -1,6 +1,7 @@
 import copy
 import logging
 import math
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Union, cast
 
@@ -130,6 +131,17 @@ class Trainer(TrainerInterface[TrainerHypers]):
         else:
             logging.info(f"Training on device {device} with dtype {dtype}")
 
+        use_bf16_autocast = dtype == torch.bfloat16 and device.type == "cuda"
+        if use_bf16_autocast:
+            logging.info(
+                "Using CUDA autocast for BF16 training (FP32 model/data, BF16 compute)."
+            )
+            model_dtype = torch.float32
+            batch_dtype = torch.float32
+        else:
+            model_dtype = dtype
+            batch_dtype = dtype
+
         # Apply fine-tuning strategy if provided
         if is_finetune:
             assert self.hypers["finetune"]["read_from"] is not None  # for mypy
@@ -154,7 +166,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 )
 
         # Move the model to the device and dtype:
-        model.to(device=device, dtype=dtype)
+        model.to(device=device, dtype=model_dtype)
         # The additive models of PET are always in float64 (to avoid numerical errors in
         # the composition weights, which can be very large).
         for additive_model in model.additive_models:
@@ -396,21 +408,29 @@ class Trainer(TrainerInterface[TrainerHypers]):
 
                 systems, targets, extra_data = unpack_batch(batch)
                 systems, targets, extra_data = batch_to(
-                    systems, targets, extra_data, dtype=dtype, device=device
+                    systems, targets, extra_data, dtype=batch_dtype, device=device
                 )
-                predictions = evaluate_model(
-                    model,
-                    systems,
-                    {key: train_targets[key] for key in targets.keys()},
-                    is_training=True,
+                autocast_ctx = (
+                    torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+                    if use_bf16_autocast
+                    else nullcontext()
                 )
+                with autocast_ctx:
+                    predictions = evaluate_model(
+                        model,
+                        systems,
+                        {key: train_targets[key] for key in targets.keys()},
+                        is_training=True,
+                    )
 
-                # average by the number of atoms
-                predictions = average_by_num_atoms(
-                    predictions, systems, per_structure_targets
-                )
-                targets = average_by_num_atoms(targets, systems, per_structure_targets)
-                train_loss_batch = loss_fn(predictions, targets, extra_data)
+                    # average by the number of atoms
+                    predictions = average_by_num_atoms(
+                        predictions, systems, per_structure_targets
+                    )
+                    targets = average_by_num_atoms(
+                        targets, systems, per_structure_targets
+                    )
+                    train_loss_batch = loss_fn(predictions, targets, extra_data)
 
                 if is_distributed:
                     # make sure all parameters contribute to the gradient calculation
@@ -521,22 +541,30 @@ class Trainer(TrainerInterface[TrainerHypers]):
                             systems_v,
                             targets_v,
                             extra_data_v,
-                            dtype=dtype,
+                            dtype=batch_dtype,
                             device=device,
                         )
-                        predictions_v = evaluate_model(
-                            model,
-                            systems_v,
-                            {key: train_targets[key] for key in targets_v},
-                            is_training=False,
+                        autocast_ctx = (
+                            torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+                            if use_bf16_autocast
+                            else nullcontext()
                         )
-                        predictions_v = average_by_num_atoms(
-                            predictions_v, systems_v, per_structure_targets
-                        )
-                        targets_v = average_by_num_atoms(
-                            targets_v, systems_v, per_structure_targets
-                        )
-                        val_loss_batch = loss_fn(predictions_v, targets_v, extra_data_v)
+                        with autocast_ctx:
+                            predictions_v = evaluate_model(
+                                model,
+                                systems_v,
+                                {key: train_targets[key] for key in targets_v},
+                                is_training=False,
+                            )
+                            predictions_v = average_by_num_atoms(
+                                predictions_v, systems_v, per_structure_targets
+                            )
+                            targets_v = average_by_num_atoms(
+                                targets_v, systems_v, per_structure_targets
+                            )
+                            val_loss_batch = loss_fn(
+                                predictions_v, targets_v, extra_data_v
+                            )
                         if is_distributed:
                             torch.distributed.all_reduce(val_loss_batch)
                         val_loss += val_loss_batch.item()
