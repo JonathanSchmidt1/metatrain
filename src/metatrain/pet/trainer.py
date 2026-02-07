@@ -426,6 +426,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                     self.hypers["log_separate_blocks"]
                 )
             timing_sums: Dict[str, float] = {
+                "dataloader_wait": 0.0,
                 "train_step_total": 0.0,
                 "unpack_batch": 0.0,
                 "batch_to": 0.0,
@@ -438,9 +439,16 @@ class Trainer(TrainerInterface[TrainerHypers]):
 
             train_loss = 0.0
             pbar = tqdm(train_dataloader, desc=f"Epoch {epoch}", leave=True)
+            last_step_end = time.perf_counter()
             for batch in pbar:
+                sync_timing_cuda()
+                batch_ready = time.perf_counter()
+                timing_sums["dataloader_wait"] += batch_ready - last_step_end
+
                 # Skip None batches (those outside batch_atom_bounds)
                 if should_skip_batch(batch, is_distributed, device):
+                    sync_timing_cuda()
+                    last_step_end = time.perf_counter()
                     continue
 
                 sync_timing_cuda()
@@ -547,6 +555,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 timed_steps += 1
                 sync_timing_cuda()
                 timing_sums["train_step_total"] += time.perf_counter() - step_start
+                last_step_end = time.perf_counter()
 
                 # Step-level wandb logging of training metrics
                 if (
@@ -735,20 +744,28 @@ class Trainer(TrainerInterface[TrainerHypers]):
                     train_loss = 0.0
 
             if profile_step_timing and timed_steps > 0 and rank == 0:
+                loop_total = timing_sums["train_step_total"] + timing_sums["dataloader_wait"]
                 avg_step_ms = 1000.0 * timing_sums["train_step_total"] / timed_steps
+                avg_wait_ms = 1000.0 * timing_sums["dataloader_wait"] / timed_steps
+                avg_loop_ms = 1000.0 * loop_total / timed_steps
                 avg_unpack_ms = 1000.0 * timing_sums["unpack_batch"] / timed_steps
                 avg_batch_to_ms = 1000.0 * timing_sums["batch_to"] / timed_steps
                 avg_forward_ms = 1000.0 * timing_sums["forward_loss"] / timed_steps
                 avg_backward_ms = 1000.0 * timing_sums["backward_opt"] / timed_steps
                 avg_metrics_ms = 1000.0 * timing_sums["metrics_logging"] / timed_steps
-                denom = max(timing_sums["train_step_total"], 1e-12)
+                denom = max(loop_total, 1e-12)
                 logging.info(
-                    "Epoch %d timing (avg/step ms): total=%.2f | unpack=%.2f "
-                    "(%.1f%%) | batch_to=%.2f (%.1f%%) | forward+loss=%.2f (%.1f%%) | "
+                    "Epoch %d timing (avg/step ms): loop_total=%.2f | dataloader_wait=%.2f "
+                    "(%.1f%%) | train_step=%.2f (%.1f%%) | unpack=%.2f (%.1f%%) | "
+                    "batch_to=%.2f (%.1f%%) | forward+loss=%.2f (%.1f%%) | "
                     "backward+opt=%.2f (%.1f%%) | metrics/log=%.2f (%.1f%%) | "
                     "validation_total=%.2fs",
                     epoch,
+                    avg_loop_ms,
+                    avg_wait_ms,
+                    100.0 * timing_sums["dataloader_wait"] / denom,
                     avg_step_ms,
+                    100.0 * timing_sums["train_step_total"] / denom,
                     avg_unpack_ms,
                     100.0 * timing_sums["unpack_batch"] / denom,
                     avg_batch_to_ms,
