@@ -1,6 +1,7 @@
 import copy
 import logging
 import math
+import time
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Union, cast
@@ -392,6 +393,28 @@ class Trainer(TrainerInterface[TrainerHypers]):
         val_every_n_steps = max(1, round(val_interval * steps_per_epoch))
         global_step = start_epoch * steps_per_epoch
         metric_logger = None
+        profile_step_timing = bool(self.hypers.get("profile_step_timing", False))
+        profile_step_timing_sync_cuda = bool(
+            self.hypers.get("profile_step_timing_sync_cuda", False)
+        )
+        use_sync_cuda_timing = profile_step_timing_sync_cuda and device.type == "cuda"
+        if profile_step_timing:
+            logging.info(
+                "Step timing profiler enabled (training-loop stage breakdown per epoch)."
+            )
+            if profile_step_timing_sync_cuda and device.type != "cuda":
+                logging.warning(
+                    "profile_step_timing_sync_cuda is enabled, but device is not CUDA. "
+                    "Falling back to non-synchronized timing."
+                )
+            elif use_sync_cuda_timing:
+                logging.info(
+                    "Using CUDA-synchronized timing for profiling (higher overhead)."
+                )
+
+        def sync_timing_cuda() -> None:
+            if use_sync_cuda_timing:
+                torch.cuda.synchronize(device)
 
         for epoch in range(start_epoch, start_epoch + self.hypers["num_epochs"]):
             if is_distributed:
@@ -402,6 +425,16 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 train_mae_calculator = MAEAccumulator(
                     self.hypers["log_separate_blocks"]
                 )
+            timing_sums: Dict[str, float] = {
+                "train_step_total": 0.0,
+                "unpack_batch": 0.0,
+                "batch_to": 0.0,
+                "forward_loss": 0.0,
+                "backward_opt": 0.0,
+                "metrics_logging": 0.0,
+                "validation_total": 0.0,
+            }
+            timed_steps = 0
 
             train_loss = 0.0
             pbar = tqdm(train_dataloader, desc=f"Epoch {epoch}", leave=True)
@@ -410,17 +443,30 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 if should_skip_batch(batch, is_distributed, device):
                     continue
 
+                sync_timing_cuda()
+                step_start = time.perf_counter()
                 optimizer.zero_grad()
 
+                sync_timing_cuda()
+                t0 = time.perf_counter()
                 systems, targets, extra_data = unpack_batch(batch)
+                sync_timing_cuda()
+                timing_sums["unpack_batch"] += time.perf_counter() - t0
+
+                sync_timing_cuda()
+                t0 = time.perf_counter()
                 systems, targets, extra_data = batch_to(
                     systems, targets, extra_data, dtype=batch_dtype, device=device
                 )
+                sync_timing_cuda()
+                timing_sums["batch_to"] += time.perf_counter() - t0
                 autocast_ctx = (
                     torch.autocast(device_type="cuda", dtype=torch.bfloat16)
                     if use_bf16_autocast
                     else nullcontext()
                 )
+                sync_timing_cuda()
+                t0 = time.perf_counter()
                 with autocast_ctx:
                     predictions = evaluate_model(
                         model,
@@ -437,6 +483,8 @@ class Trainer(TrainerInterface[TrainerHypers]):
                         targets, systems, per_structure_targets
                     )
                     train_loss_batch = loss_fn(predictions, targets, extra_data)
+                sync_timing_cuda()
+                timing_sums["forward_loss"] += time.perf_counter() - t0
 
                 if is_distributed:
                     # make sure all parameters contribute to the gradient calculation
@@ -444,18 +492,24 @@ class Trainer(TrainerInterface[TrainerHypers]):
                     for param in model.parameters():
                         train_loss_batch += 0.0 * param.sum()
 
+                sync_timing_cuda()
+                t0 = time.perf_counter()
                 train_loss_batch.backward()
                 torch.nn.utils.clip_grad_norm_(
                     model.parameters(), self.hypers["grad_clip_norm"]
                 )
                 optimizer.step()
                 lr_scheduler.step()
+                sync_timing_cuda()
+                timing_sums["backward_opt"] += time.perf_counter() - t0
 
                 if is_distributed:
                     # sum the loss over all processes
                     torch.distributed.all_reduce(train_loss_batch)
                 train_loss += train_loss_batch.item()
 
+                sync_timing_cuda()
+                t0 = time.perf_counter()
                 scaled_predictions = (model.module if is_distributed else model).scaler(
                     systems, predictions
                 )
@@ -486,8 +540,13 @@ class Trainer(TrainerInterface[TrainerHypers]):
                             f"{torch.sqrt(torch.mean((pg - tg) ** 2)).item():.4e}"
                         )
                 pbar.set_postfix(postfix)
+                sync_timing_cuda()
+                timing_sums["metrics_logging"] += time.perf_counter() - t0
 
                 global_step += 1
+                timed_steps += 1
+                sync_timing_cuda()
+                timing_sums["train_step_total"] += time.perf_counter() - step_start
 
                 # Step-level wandb logging of training metrics
                 if (
@@ -531,6 +590,8 @@ class Trainer(TrainerInterface[TrainerHypers]):
 
                 # Step-level validation
                 if global_step % val_every_n_steps == 0:
+                    sync_timing_cuda()
+                    val_start = time.perf_counter()
                     val_rmse_calculator = RMSEAccumulator(
                         self.hypers["log_separate_blocks"]
                     )
@@ -587,6 +648,8 @@ class Trainer(TrainerInterface[TrainerHypers]):
                             val_mae_calculator.update(
                                 scaled_preds_v, scaled_tgts_v, extra_data_v
                             )
+                    sync_timing_cuda()
+                    timing_sums["validation_total"] += time.perf_counter() - val_start
 
                     # Finalize validation metrics
                     finalized_val_info = val_rmse_calculator.finalize(
@@ -670,6 +733,34 @@ class Trainer(TrainerInterface[TrainerHypers]):
                             self.hypers["log_separate_blocks"]
                         )
                     train_loss = 0.0
+
+            if profile_step_timing and timed_steps > 0 and rank == 0:
+                avg_step_ms = 1000.0 * timing_sums["train_step_total"] / timed_steps
+                avg_unpack_ms = 1000.0 * timing_sums["unpack_batch"] / timed_steps
+                avg_batch_to_ms = 1000.0 * timing_sums["batch_to"] / timed_steps
+                avg_forward_ms = 1000.0 * timing_sums["forward_loss"] / timed_steps
+                avg_backward_ms = 1000.0 * timing_sums["backward_opt"] / timed_steps
+                avg_metrics_ms = 1000.0 * timing_sums["metrics_logging"] / timed_steps
+                denom = max(timing_sums["train_step_total"], 1e-12)
+                logging.info(
+                    "Epoch %d timing (avg/step ms): total=%.2f | unpack=%.2f "
+                    "(%.1f%%) | batch_to=%.2f (%.1f%%) | forward+loss=%.2f (%.1f%%) | "
+                    "backward+opt=%.2f (%.1f%%) | metrics/log=%.2f (%.1f%%) | "
+                    "validation_total=%.2fs",
+                    epoch,
+                    avg_step_ms,
+                    avg_unpack_ms,
+                    100.0 * timing_sums["unpack_batch"] / denom,
+                    avg_batch_to_ms,
+                    100.0 * timing_sums["batch_to"] / denom,
+                    avg_forward_ms,
+                    100.0 * timing_sums["forward_loss"] / denom,
+                    avg_backward_ms,
+                    100.0 * timing_sums["backward_opt"] / denom,
+                    avg_metrics_ms,
+                    100.0 * timing_sums["metrics_logging"] / denom,
+                    timing_sums["validation_total"],
+                )
 
             if epoch % self.hypers["checkpoint_interval"] == 0:
                 if is_distributed:
