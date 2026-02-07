@@ -6,8 +6,8 @@ from typing import Any, Dict, List, Literal, Optional, Union, cast
 
 import torch
 from torch.optim.lr_scheduler import LambdaLR
-from tqdm import tqdm
 from torch.utils.data import DataLoader, DistributedSampler
+from tqdm import tqdm
 
 from metatrain.utils.abc import ModelInterface, TrainerInterface
 from metatrain.utils.additive import get_remove_additive_transform
@@ -452,12 +452,10 @@ class Trainer(TrainerInterface[TrainerHypers]):
                     rmse = torch.sqrt(torch.mean((pred - tgt) ** 2)).item()
                     postfix[key] = f"{rmse:.4e}"
                     if scaled_predictions[key].block().has_gradient("positions"):
-                        pg = scaled_predictions[key].block().gradient(
-                            "positions"
-                        ).values
-                        tg = scaled_targets[key].block().gradient(
-                            "positions"
-                        ).values
+                        pg = (
+                            scaled_predictions[key].block().gradient("positions").values
+                        )
+                        tg = scaled_targets[key].block().gradient("positions").values
                         postfix["forces"] = (
                             f"{torch.sqrt(torch.mean((pg - tg) ** 2)).item():.4e}"
                         )
@@ -474,9 +472,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                         if isinstance(handler, WandbHandler):
                             wandb_data = {
                                 "step/loss": train_loss_batch.item(),
-                                "step/learning_rate": (
-                                    optimizer.param_groups[0]["lr"]
-                                ),
+                                "step/learning_rate": (optimizer.param_groups[0]["lr"]),
                             }
                             for key in scaled_predictions:
                                 p = scaled_predictions[key].block().values
@@ -484,15 +480,23 @@ class Trainer(TrainerInterface[TrainerHypers]):
                                 wandb_data[f"step/{key}_rmse"] = torch.sqrt(
                                     torch.mean((p - t) ** 2)
                                 ).item()
-                                if scaled_predictions[key].block().has_gradient(
-                                    "positions"
+                                if (
+                                    scaled_predictions[key]
+                                    .block()
+                                    .has_gradient("positions")
                                 ):
-                                    pg = scaled_predictions[key].block().gradient(
-                                        "positions"
-                                    ).values
-                                    tg = scaled_targets[key].block().gradient(
-                                        "positions"
-                                    ).values
+                                    pg = (
+                                        scaled_predictions[key]
+                                        .block()
+                                        .gradient("positions")
+                                        .values
+                                    )
+                                    tg = (
+                                        scaled_targets[key]
+                                        .block()
+                                        .gradient("positions")
+                                        .values
+                                    )
                                     wandb_data["step/forces_rmse"] = torch.sqrt(
                                         torch.mean((pg - tg) ** 2)
                                     ).item()
@@ -512,12 +516,13 @@ class Trainer(TrainerInterface[TrainerHypers]):
                     for val_batch in val_dataloader:
                         if should_skip_batch(val_batch, is_distributed, device):
                             continue
-                        systems_v, targets_v, extra_data_v = unpack_batch(
-                            val_batch
-                        )
+                        systems_v, targets_v, extra_data_v = unpack_batch(val_batch)
                         systems_v, targets_v, extra_data_v = batch_to(
-                            systems_v, targets_v, extra_data_v,
-                            dtype=dtype, device=device,
+                            systems_v,
+                            targets_v,
+                            extra_data_v,
+                            dtype=dtype,
+                            device=device,
                         )
                         predictions_v = evaluate_model(
                             model,
@@ -531,9 +536,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                         targets_v = average_by_num_atoms(
                             targets_v, systems_v, per_structure_targets
                         )
-                        val_loss_batch = loss_fn(
-                            predictions_v, targets_v, extra_data_v
-                        )
+                        val_loss_batch = loss_fn(predictions_v, targets_v, extra_data_v)
                         if is_distributed:
                             torch.distributed.all_reduce(val_loss_batch)
                         val_loss += val_loss_batch.item()
@@ -553,8 +556,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
 
                     # Finalize validation metrics
                     finalized_val_info = val_rmse_calculator.finalize(
-                        not_per_atom=["positions_gradients"]
-                        + per_structure_targets,
+                        not_per_atom=["positions_gradients"] + per_structure_targets,
                         is_distributed=is_distributed,
                         device=device,
                     )
@@ -570,8 +572,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
 
                     # Finalize training metrics (window since last reset)
                     finalized_train_info = train_rmse_calculator.finalize(
-                        not_per_atom=["positions_gradients"]
-                        + per_structure_targets,
+                        not_per_atom=["positions_gradients"] + per_structure_targets,
                         is_distributed=is_distributed,
                         device=device,
                     )
@@ -601,9 +602,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                             dataset_info=(
                                 model.module if is_distributed else model
                             ).dataset_info,
-                            initial_metrics=[
-                                finalized_train_info, finalized_val_info
-                            ],
+                            initial_metrics=[finalized_train_info, finalized_val_info],
                             names=["training", "validation"],
                         )
                     metric_logger.log(
@@ -621,9 +620,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                     if val_metric < self.best_metric:
                         self.best_metric = val_metric
                         self.best_model_state_dict = copy.deepcopy(
-                            (
-                                model.module if is_distributed else model
-                            ).state_dict()
+                            (model.module if is_distributed else model).state_dict()
                         )
                         self.best_epoch = epoch
                         self.best_optimizer_state_dict = copy.deepcopy(
