@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Literal, Optional, Union, cast
 
 import torch
 from torch.optim.lr_scheduler import LambdaLR
+from tqdm import tqdm
 from torch.utils.data import DataLoader, DistributedSampler
 
 from metatrain.utils.abc import ModelInterface, TrainerInterface
@@ -378,7 +379,8 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 val_mae_calculator = MAEAccumulator(self.hypers["log_separate_blocks"])
 
             train_loss = 0.0
-            for batch in train_dataloader:
+            pbar = tqdm(train_dataloader, desc=f"Epoch {epoch}", leave=True)
+            for batch in pbar:
                 # Skip None batches (those outside batch_atom_bounds)
                 if should_skip_batch(batch, is_distributed, device):
                     continue
@@ -434,6 +436,25 @@ class Trainer(TrainerInterface[TrainerHypers]):
                     train_mae_calculator.update(
                         scaled_predictions, scaled_targets, extra_data
                     )
+
+                # Update tqdm progress bar with per-batch errors
+                postfix = {"loss": f"{train_loss_batch.item():.4e}"}
+                for key in scaled_predictions:
+                    pred = scaled_predictions[key].block().values
+                    tgt = scaled_targets[key].block().values
+                    rmse = torch.sqrt(torch.mean((pred - tgt) ** 2)).item()
+                    postfix[key] = f"{rmse:.4e}"
+                    if scaled_predictions[key].block().has_gradient("positions"):
+                        pg = scaled_predictions[key].block().gradient(
+                            "positions"
+                        ).values
+                        tg = scaled_targets[key].block().gradient(
+                            "positions"
+                        ).values
+                        postfix["forces"] = (
+                            f"{torch.sqrt(torch.mean((pg - tg) ** 2)).item():.4e}"
+                        )
+                pbar.set_postfix(postfix)
 
             finalized_train_info = train_rmse_calculator.finalize(
                 not_per_atom=["positions_gradients"] + per_structure_targets,
