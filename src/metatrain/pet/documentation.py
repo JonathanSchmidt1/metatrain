@@ -244,6 +244,18 @@ class TrainerHypers(TypedDict):
     counts outside these bounds will be skipped during training. Use ``None`` for
     either value to disable that bound. This is useful for preventing out-of-memory
     errors and ensuring consistent computational load. Default: ``[None, None]``."""
+    profile_step_timing: bool = False
+    """Enable step-level timing breakdown logs per epoch.
+
+    This reports average time spent in major training stages (unpack, transfer,
+    forward/loss, backward/optimizer, metrics/logging), helping identify bottlenecks.
+    """
+    profile_step_timing_sync_cuda: bool = False
+    """Synchronize CUDA when collecting timing metrics.
+
+    This makes GPU timings more accurate but adds noticeable overhead and should be
+    used only for profiling runs.
+    """
 
     finetune: NoFinetuneHypers | FinetuneHypers = {
         "read_from": None,
