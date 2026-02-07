@@ -38,7 +38,7 @@ def default_device(_root_: BaseContainer) -> str:
         return desired_device[0].type
 
 
-def default_precision(_root_: BaseContainer) -> int:
+def default_precision(_root_: BaseContainer) -> Union[int, str]:
     """
     Custom OmegaConf resolver to find the default precision of an architecture.
 
@@ -61,6 +61,8 @@ def default_precision(_root_: BaseContainer) -> int:
         return 32
     elif default_dtype == torch.float16:
         return 16
+    elif default_dtype == torch.bfloat16:
+        return "bf16"
     else:
         raise ValueError(
             f"architectures `default_dtype` ({default_dtype}) refers to an unknown "

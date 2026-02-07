@@ -208,10 +208,11 @@ class BaseHypers(TypedDict):
     parameter is to use either either ``"cpu"``, ``"gpu"``, ``"multi-gpu"``. Internally,
     under the choice ``"gpu"``, the script will automatically choose between ``"cuda"``
     or ``"mps"``."""
-    base_precision: NotRequired[Literal[16, 32, 64]]
+    base_precision: NotRequired[Literal[16, 32, 64, "bf16"]]
     """The base precision for float values. For example, a value of ``16`` corresponds
-    to the data type ``float16``. The datatypes that are supported as well as the
-    default datatype depend on the model architecture used."""
+    to the data type ``float16``, and ``"bf16"`` corresponds to ``bfloat16``. The
+    datatypes that are supported as well as the default datatype depend on the model
+    architecture used."""
     seed: NotRequired[NonNegativeInt]
     """The seed used for non-deterministic operations. It sets the seed of
     ``numpy.random``, ``random``, ``torch`` and ``torch.cuda``. This parameter is

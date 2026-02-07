@@ -230,7 +230,10 @@ def train_model(
     )
 
     # process base_precision/dtypes
-    dtype = getattr(torch, f"float{options['base_precision']}")
+    if options["base_precision"] == "bf16":
+        dtype = torch.bfloat16
+    else:
+        dtype = getattr(torch, f"float{options['base_precision']}")
 
     if dtype not in Model.__supported_dtypes__:
         raise ValueError(
