@@ -1,17 +1,23 @@
+import copy
+
 import pytest
 import torch
 from metatomic.torch import ModelOutput, System
+from omegaconf import OmegaConf
 
-from metatrain.pet import PET
+from metatrain.pet import PET, Trainer
 from metatrain.pet.modules.transformer import AttentionBlock
-from metatrain.utils.data import DatasetInfo
+from metatrain.utils.data import Dataset, DatasetInfo
+from metatrain.utils.data.readers import read_systems, read_targets
 from metatrain.utils.data.target_info import (
     get_energy_target_info,
     get_generic_target_info,
 )
+from metatrain.utils.hypers import init_with_defaults
+from metatrain.utils.loss import LossSpecification
 from metatrain.utils.neighbor_lists import get_system_with_neighbor_lists
 
-from . import MODEL_HYPERS
+from . import DATASET_WITH_FORCES_PATH, DEFAULT_HYPERS, MODEL_HYPERS
 
 
 def test_pet_padding():
@@ -123,3 +129,83 @@ def test_nc_stress(per_atom):
     outputs = {"non_conservative_stress": ModelOutput(per_atom=per_atom)}
     stress = model([system], outputs)["non_conservative_stress"].block().values
     assert torch.allclose(stress, stress.transpose(1, 2))
+
+
+def test_muon_optimizer(tmp_path):
+    """Test that Muon optimizer trains without error and splits params correctly."""
+    torch.manual_seed(0)
+
+    systems = read_systems(DATASET_WITH_FORCES_PATH)
+    conf = {
+        "energy": {
+            "quantity": "energy",
+            "read_from": DATASET_WITH_FORCES_PATH,
+            "reader": "ase",
+            "key": "energy",
+            "unit": "eV",
+            "type": "scalar",
+            "per_atom": False,
+            "num_subtargets": 1,
+            "forces": {"read_from": DATASET_WITH_FORCES_PATH, "key": "force"},
+            "stress": False,
+            "virial": False,
+        }
+    }
+    targets, target_info_dict = read_targets(OmegaConf.create(conf))
+    dataset = Dataset.from_dict({"system": systems, "energy": targets["energy"]})
+
+    hypers = copy.deepcopy(DEFAULT_HYPERS)
+    hypers["training"]["num_epochs"] = 2
+    hypers["training"]["use_muon"] = True
+    hypers["training"]["weight_decay"] = 0.01
+    hypers["training"]["atomic_baseline"] = {"energy": 0.0}
+    loss_conf = {"energy": init_with_defaults(LossSpecification)}
+    loss_conf["energy"]["gradients"] = {
+        "positions": init_with_defaults(LossSpecification)
+    }
+    loss_conf = OmegaConf.create(loss_conf)
+    OmegaConf.resolve(loss_conf)
+    hypers["training"]["loss"] = loss_conf
+
+    dataset_info = DatasetInfo(
+        length_unit="Angstrom", atomic_types=[6], targets=target_info_dict
+    )
+    model = PET(MODEL_HYPERS, dataset_info)
+
+    # Verify parameter split: check that Muon would get 2D+ non-embed/norm params
+    muon_params = []
+    adamw_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if (
+            param.ndim >= 2
+            and "embed" not in name
+            and "norm" not in name
+            and "scaler" not in name
+            and "additive" not in name
+        ):
+            muon_params.append(name)
+        else:
+            adamw_params.append(name)
+
+    assert len(muon_params) > 0, "Muon should get at least some parameters"
+    assert len(adamw_params) > 0, "AdamW should get at least some parameters"
+    # All bias params should be in adamw
+    for name in adamw_params:
+        if "bias" in name:
+            assert name not in muon_params
+    # All embedding params should be in adamw
+    for name in adamw_params:
+        if "embed" in name:
+            assert name not in muon_params
+
+    trainer = Trainer(hypers["training"])
+    trainer.train(
+        model=model,
+        dtype=torch.float32,
+        devices=[torch.device("cpu")],
+        train_datasets=[dataset],
+        val_datasets=[dataset],
+        checkpoint_dir=str(tmp_path),
+    )
