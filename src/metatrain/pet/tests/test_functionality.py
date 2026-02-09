@@ -184,6 +184,7 @@ def test_muon_optimizer(tmp_path):
             and "norm" not in name
             and "scaler" not in name
             and "additive" not in name
+            and "last_layer" not in name
         ):
             muon_params.append(name)
         else:
