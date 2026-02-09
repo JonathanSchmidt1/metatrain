@@ -179,6 +179,13 @@ class TrainerHypers(TypedDict):
     learning_rate: float = 1e-4
     """Learning rate."""
     weight_decay: Optional[float] = None
+    use_muon: bool = False
+    """Use the Muon optimizer for 2D+ weight matrices (hidden Linear weights).
+    Remaining parameters (biases, norms, embeddings, scalers) use AdamW.
+    Requires PyTorch >= 2.9. Uses ``match_rms_adamw`` LR scaling so the same
+    ``learning_rate`` works for both optimizers."""
+    muon_momentum: float = 0.95
+    """Momentum for the Muon optimizer."""
 
     log_interval: float = 1.0
     """Interval to log metrics, in units of epochs. Fractional values enable

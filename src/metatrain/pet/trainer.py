@@ -80,18 +80,24 @@ def get_scheduler(
 
 
 class Trainer(TrainerInterface[TrainerHypers]):
-    __checkpoint_version__ = 12
+    __checkpoint_version__ = 13
 
     def __init__(self, hypers: TrainerHypers) -> None:
         super().__init__(hypers)
 
-        self.optimizer_state_dict: Optional[Dict[str, Any]] = None
-        self.scheduler_state_dict: Optional[Dict[str, Any]] = None
+        self.optimizer_state_dict: Optional[Dict[str, Any] | List[Dict[str, Any]]] = (
+            None
+        )
+        self.scheduler_state_dict: Optional[Dict[str, Any] | List[Dict[str, Any]]] = (
+            None
+        )
         self.epoch: Optional[int] = None
         self.best_epoch: Optional[int] = None
         self.best_metric: Optional[float] = None
         self.best_model_state_dict: Optional[Dict[str, Any]] = None
-        self.best_optimizer_state_dict: Optional[Dict[str, Any]] = None
+        self.best_optimizer_state_dict: Optional[
+            Dict[str, Any] | List[Dict[str, Any]]
+        ] = None
 
     def train(
         self,
@@ -347,30 +353,85 @@ class Trainer(TrainerInterface[TrainerHypers]):
             for grad, ginfo in info["gradients"].items():
                 logging.info(f"\t{name}::{grad}: {ginfo}")
 
-        if self.hypers["weight_decay"] is not None:
-            optimizer = torch.optim.AdamW(
-                model.parameters(),
-                lr=self.hypers["learning_rate"],
-                weight_decay=self.hypers["weight_decay"],
+        if self.hypers["use_muon"]:
+            from torch.optim import Muon
+
+            muon_params = []
+            adamw_params = []
+            for name, param in model.named_parameters():
+                if not param.requires_grad:
+                    continue
+                if (
+                    param.ndim >= 2
+                    and "embed" not in name
+                    and "norm" not in name
+                    and "scaler" not in name
+                    and "additive" not in name
+                ):
+                    muon_params.append(param)
+                else:
+                    adamw_params.append(param)
+            n_muon = sum(p.numel() for p in muon_params)
+            n_adamw = sum(p.numel() for p in adamw_params)
+            logging.info(
+                f"Muon optimizer: {len(muon_params)} params ({n_muon} elements), "
+                f"AdamW: {len(adamw_params)} params ({n_adamw} elements)"
             )
+            wd = self.hypers["weight_decay"] or 0.0
+            optimizers = [
+                Muon(
+                    muon_params,
+                    lr=self.hypers["learning_rate"],
+                    momentum=self.hypers["muon_momentum"],
+                    adjust_lr_fn="match_rms_adamw",
+                    weight_decay=wd,
+                ),
+                torch.optim.AdamW(
+                    adamw_params,
+                    lr=self.hypers["learning_rate"],
+                    weight_decay=wd,
+                ),
+            ]
+        elif self.hypers["weight_decay"] is not None:
+            optimizers = [
+                torch.optim.AdamW(
+                    model.parameters(),
+                    lr=self.hypers["learning_rate"],
+                    weight_decay=self.hypers["weight_decay"],
+                )
+            ]
         else:
-            optimizer = torch.optim.Adam(
-                model.parameters(), lr=self.hypers["learning_rate"]
-            )
+            optimizers = [
+                torch.optim.Adam(model.parameters(), lr=self.hypers["learning_rate"])
+            ]
 
         if self.optimizer_state_dict is not None and not is_finetune:
             # try to load the optimizer state dict, but this is only possible
             # if there are no new targets in the model (new parameters)
             if not (model.module if is_distributed else model).has_new_targets:
-                optimizer.load_state_dict(self.optimizer_state_dict)
+                if isinstance(self.optimizer_state_dict, list):
+                    for opt, state in zip(
+                        optimizers, self.optimizer_state_dict, strict=True
+                    ):
+                        opt.load_state_dict(state)
+                else:
+                    optimizers[0].load_state_dict(self.optimizer_state_dict)
 
-        # Create a learning rate scheduler
-        lr_scheduler = get_scheduler(optimizer, self.hypers, len(train_dataloader))
+        # Create learning rate schedulers (one per optimizer)
+        lr_schedulers = [
+            get_scheduler(opt, self.hypers, len(train_dataloader)) for opt in optimizers
+        ]
 
         if self.scheduler_state_dict is not None and not is_finetune:
             # same as the optimizer, try to load the scheduler state dict
             if not (model.module if is_distributed else model).has_new_targets:
-                lr_scheduler.load_state_dict(self.scheduler_state_dict)
+                if isinstance(self.scheduler_state_dict, list):
+                    for sched, state in zip(
+                        lr_schedulers, self.scheduler_state_dict, strict=True
+                    ):
+                        sched.load_state_dict(state)
+                else:
+                    lr_schedulers[0].load_state_dict(self.scheduler_state_dict)
 
         per_structure_targets = self.hypers["per_structure_targets"]
 
@@ -455,7 +516,8 @@ class Trainer(TrainerInterface[TrainerHypers]):
 
                 sync_timing_cuda()
                 step_start = time.perf_counter()
-                optimizer.zero_grad()
+                for opt in optimizers:
+                    opt.zero_grad()
 
                 sync_timing_cuda()
                 t0 = time.perf_counter()
@@ -514,8 +576,10 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 torch.nn.utils.clip_grad_norm_(
                     model.parameters(), self.hypers["grad_clip_norm"]
                 )
-                optimizer.step()
-                lr_scheduler.step()
+                for opt in optimizers:
+                    opt.step()
+                for sched in lr_schedulers:
+                    sched.step()
                 sync_timing_cuda()
                 timing_sums["backward_opt"] += time.perf_counter() - t0
 
@@ -574,7 +638,9 @@ class Trainer(TrainerInterface[TrainerHypers]):
                         if isinstance(handler, WandbHandler):
                             wandb_data = {
                                 "step/loss": train_loss_batch.item(),
-                                "step/learning_rate": (optimizer.param_groups[0]["lr"]),
+                                "step/learning_rate": optimizers[0].param_groups[0][
+                                    "lr"
+                                ],
                             }
                             for key in scaled_predictions:
                                 p = scaled_predictions[key].block().values
@@ -723,7 +789,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                         metrics=[finalized_train_info, finalized_val_info],
                         epoch=global_step,
                         rank=rank,
-                        learning_rate=optimizer.param_groups[0]["lr"],
+                        learning_rate=optimizers[0].param_groups[0]["lr"],
                     )
 
                     # Best model tracking
@@ -738,7 +804,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                         )
                         self.best_epoch = epoch
                         self.best_optimizer_state_dict = copy.deepcopy(
-                            optimizer.state_dict()
+                            [opt.state_dict() for opt in optimizers]
                         )
 
                     # Reset training accumulators for next window
@@ -795,8 +861,8 @@ class Trainer(TrainerInterface[TrainerHypers]):
             if epoch % self.hypers["checkpoint_interval"] == 0:
                 if is_distributed:
                     torch.distributed.barrier()
-                self.optimizer_state_dict = optimizer.state_dict()
-                self.scheduler_state_dict = lr_scheduler.state_dict()
+                self.optimizer_state_dict = [o.state_dict() for o in optimizers]
+                self.scheduler_state_dict = [s.state_dict() for s in lr_schedulers]
                 self.epoch = epoch
                 if rank == 0:
                     self.save_checkpoint(
@@ -806,8 +872,8 @@ class Trainer(TrainerInterface[TrainerHypers]):
 
         # prepare for the checkpoint that will be saved outside the function
         self.epoch = epoch
-        self.optimizer_state_dict = optimizer.state_dict()
-        self.scheduler_state_dict = lr_scheduler.state_dict()
+        self.optimizer_state_dict = [o.state_dict() for o in optimizers]
+        self.scheduler_state_dict = [s.state_dict() for s in lr_schedulers]
 
         if is_distributed:
             torch.distributed.destroy_process_group()
