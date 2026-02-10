@@ -161,6 +161,7 @@ class MuonWithAuxAdamW(torch.optim.Optimizer):
                     params,
                     lr=group["lr"],
                     momentum=group["momentum"],
+                    adjust_lr_fn="match_rms_adamw",
                 )
             else:
                 self.adamw_optimizer = torch.optim.AdamW(

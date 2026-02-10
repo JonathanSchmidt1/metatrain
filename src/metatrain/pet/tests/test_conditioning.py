@@ -99,20 +99,19 @@ def test_conditioning_different_d_node_d_pet():
     assert "energy" in result
 
 
-def _train_steps(model, n_steps=10):
-    """Do a few optimizer steps to break the zero-init of the conditioning gate."""
-    model.train()
-    for _ in range(n_steps):
-        system = _make_system(model, charge=2, spin=3)
-        outputs = {"energy": ModelOutput(per_atom=False)}
-        result = model([system], outputs)
-        loss = result["energy"].block().values.sum()
-        loss.backward()
-        with torch.no_grad():
-            for p in model.parameters():
-                if p.grad is not None:
-                    p -= 0.001 * p.grad
-                    p.grad.zero_()
+def _activate_conditioning_gate(model):
+    """Set the zero-initialized conditioning gate to non-zero values.
+
+    The gate in SystemConditioningEmbedding is zero-initialized for stable
+    training. For testing that the conditioning *pathway* produces different
+    outputs for different charge/spin, we directly set the gate weights to
+    non-zero values instead of relying on many training steps.
+    """
+    assert model.system_conditioning is not None
+    with torch.no_grad():
+        gate = model.system_conditioning.project[2]  # the zero-initialized Linear
+        torch.nn.init.uniform_(gate.weight, -0.5, 0.5)
+        torch.nn.init.uniform_(gate.bias, -0.1, 0.1)
     model.eval()
 
 
@@ -120,7 +119,7 @@ def test_conditioning_changes_output():
     """Same structure with different charges should produce different predictions."""
     hypers = _small_hypers()
     model = PET(hypers, _dataset_info())
-    _train_steps(model)
+    _activate_conditioning_gate(model)
 
     system_neutral = _make_system(model, charge=0, spin=1)
     system_charged = _make_system(model, charge=2, spin=1)
@@ -174,7 +173,7 @@ def test_conditioning_batch_independence():
     """Changing charge of one system in a batch should not affect others."""
     hypers = _small_hypers()
     model = PET(hypers, _dataset_info())
-    _train_steps(model)
+    _activate_conditioning_gate(model)
 
     system_a = _make_system(model, charge=0, spin=1)
     system_b_v1 = _make_system(model, charge=1, spin=1)
