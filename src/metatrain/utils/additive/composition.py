@@ -213,16 +213,16 @@ class CompositionModel(torch.nn.Module):
 
         # Create dataloader for the training datasets. Note that these might need
         # neighbor lists if any of the `additive_models` require them.
-        # requested_neighbor_lists = []
-        # for additive_model in additive_models:
-        #     if hasattr(additive_model, "requested_neighbor_lists"):
-        #         requested_neighbor_lists += additive_model.requested_neighbor_lists()
-        # dataloader = self._get_dataloader(
-        #     datasets,
-        #     requested_neighbor_lists,
-        #     batch_size,
-        #     is_distributed=is_distributed,
-        # )
+        requested_neighbor_lists = []
+        for additive_model in additive_models:
+            if hasattr(additive_model, "requested_neighbor_lists"):
+                requested_neighbor_lists += additive_model.requested_neighbor_lists()
+        dataloader = self._get_dataloader(
+            datasets,
+            requested_neighbor_lists,
+            batch_size,
+            is_distributed=is_distributed,
+        )
 
         if fixed_weights is None:
             fixed_weights = {}
