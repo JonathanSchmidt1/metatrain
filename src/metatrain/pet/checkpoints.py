@@ -264,6 +264,16 @@ def model_update_v10_v11(checkpoint: dict) -> None:
     if "attention_temperature" not in checkpoint["model_data"]["model_hypers"]:
         checkpoint["model_data"]["model_hypers"]["attention_temperature"] = 1.0
 
+    # Renaming edge_embedder to edge_linear
+    for key in ["model_state_dict", "best_model_state_dict"]:
+        if (state_dict := checkpoint.get(key)) is not None:
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                if "gnn_layers" in k and ".edge_embedder." in k:
+                    k = k.replace(".edge_embedder.", ".edge_linear.")
+                new_state_dict[k] = v
+            checkpoint[key] = new_state_dict
+
 
 ###########################
 # TRAINER #################
@@ -420,3 +430,10 @@ def trainer_update_v11_v12(checkpoint: dict) -> None:
     :param checkpoint: The checkpoint to update.
     """
     checkpoint["train_hypers"]["batch_atom_bounds"] = [None, None]
+
+    if "optimizer" not in checkpoint["train_hypers"]:
+        if checkpoint["train_hypers"].get("weight_decay"):
+            optimizer = "AdamW"
+        else:
+            optimizer = "Adam"
+        checkpoint["train_hypers"]["optimizer"] = optimizer
