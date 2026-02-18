@@ -910,6 +910,38 @@ def _make_system_contiguous(system: System) -> System:
         new_system.add_data(key, make_contiguous(data))
     return new_system
 
+import re
+
+def _properties_name(output_name: str) -> str:
+    # strip variants: "energy/foo" -> "energy"
+    base = output_name.split("/", 1)[0]
+
+    # metatomic standardized outputs generally want the base name as the properties dim name
+    # (energy explicitly requires "energy")
+    if base in {
+        "energy",
+        "non_conservative_forces",
+        "non_conservative_stress",
+        "masses",
+        "positions",
+        "momenta",
+        "velocities",
+        "charges",
+        "features",
+    }:
+        return base if base != "features" else "properties"  # features properties are arbitrary anyway
+
+    # custom outputs: "mtt::petmad" -> "petmad"
+    if "::" in base:
+        base = base.split("::")[-1]
+
+    # sanitize to something metatensor Labels accepts
+    base = re.sub(r"[^A-Za-z0-9_]", "_", base)
+    if base == "" or base[0].isdigit():
+        base = "properties"
+
+    return base
+
 
 class MemmapArray:
     """
@@ -1114,7 +1146,8 @@ class MemmapDataset(TorchDataset):
                 ),
                 samples=samples,
                 components=components,
-                properties=Labels.range(target_key, target_array.shape[-1]),
+                #properties=Labels.range(target_key, target_array.shape[-1]),
+                properties=Labels.range(_properties_name(target_key), target_array.shape[-1]),
             )
 
             # handle energy gradients
@@ -1196,8 +1229,10 @@ class MemmapDataset(TorchDataset):
                 ),
             )
 
-        sample = self.sample_class(**{"system": system, **target_dict})
-        return sample
+        # sample = self.sample_class(**{"system": system, **target_dict})
+        # return sample
+        values = [system] + [target_dict[k] for k in self.target_config.keys()]
+        return self.sample_class(*values)
 
     def get_target_info(self) -> Dict[str, TargetInfo]:
         """
