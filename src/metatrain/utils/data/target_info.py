@@ -39,6 +39,7 @@ class TargetInfo:
         quantity: str = "",
         unit: str = "",
         description: str = "",
+        is_intensive: bool = False,
     ):
         # one of these will be set to True inside the _check_layout method
         self.is_scalar = False
@@ -54,6 +55,7 @@ class TargetInfo:
         self.quantity = quantity
         self.unit = unit
         self.description = description
+        self.is_intensive = is_intensive
 
         self.blocks_shape: Dict[str, List[int]] = {}
         self._set_blocks_shape()
@@ -84,7 +86,8 @@ class TargetInfo:
     def __repr__(self) -> str:
         return (
             f"TargetInfo(layout={self.layout}, quantity='{self.quantity}', "
-            f"unit='{self.unit}', description='{self.description}')"
+            f"unit='{self.unit}', description='{self.description}', "
+            f"is_intensive={self.is_intensive})"
         )
 
     @torch.jit.unused
@@ -95,6 +98,7 @@ class TargetInfo:
             self.quantity == other.quantity
             and self.unit == other.unit
             and self.description == other.description
+            and self.is_intensive == other.is_intensive
             # we can't use metatensor.torch.equal here because we want to allow
             # for potential gradient mismatches (e.g. energy-0nly vs energy+forces)
             and _is_equal_up_to_gradients(self.layout, other.layout)
@@ -276,6 +280,7 @@ class TargetInfo:
             quantity=self.quantity,
             unit=self.unit,
             description=self.description,
+            is_intensive=self.is_intensive,
         )
 
     @torch.jit.unused
@@ -294,6 +299,7 @@ class TargetInfo:
         self.quantity = state["quantity"]
         self.unit = state["unit"]
         self.description = state.get("description", "")
+        self.is_intensive = state.get("is_intensive", False)
 
         # For backward compatibility, if blocks_shape is not in the state,
         # we build it.
@@ -411,6 +417,20 @@ def _get_scalar_target_info(target_name: str, target: DictConfig) -> TargetInfo:
     if target["per_atom"]:
         sample_names.append("atom")
 
+    aggregation = target.get("aggregation", "sum")
+    if aggregation not in ("sum", "mean"):
+        raise ValueError(
+            f"Invalid aggregation '{aggregation}' for target '{target_name}'. "
+            "Supported values are 'sum' (extensive) and 'mean' (intensive)."
+        )
+    if target["per_atom"] and aggregation == "mean":
+        raise ValueError(
+            f"Target '{target_name}' cannot have both 'per_atom: true' and "
+            "'aggregation: mean'. Use 'per_atom: true' for per-atom outputs or "
+            "'aggregation: mean' for intensive (averaged) outputs."
+        )
+    is_intensive = aggregation == "mean"
+
     block = TensorBlock(
         # float64: otherwise metatensor can't serialize
         values=torch.empty(0, target["num_subtargets"], dtype=torch.float64),
@@ -437,6 +457,7 @@ def _get_scalar_target_info(target_name: str, target: DictConfig) -> TargetInfo:
         quantity=target["quantity"],
         unit=target["unit"],
         description=target.get("description", ""),
+        is_intensive=is_intensive,
     )
 
 
@@ -444,6 +465,20 @@ def _get_cartesian_target_info(target_name: str, target: DictConfig) -> TargetIn
     sample_names = ["system"]
     if target["per_atom"]:
         sample_names.append("atom")
+
+    aggregation = target.get("aggregation", "sum")
+    if aggregation not in ("sum", "mean"):
+        raise ValueError(
+            f"Invalid aggregation '{aggregation}' for target '{target_name}'. "
+            "Supported values are 'sum' (extensive) and 'mean' (intensive)."
+        )
+    if target["per_atom"] and aggregation == "mean":
+        raise ValueError(
+            f"Target '{target_name}' cannot have both 'per_atom: true' and "
+            "'aggregation: mean'. Use 'per_atom: true' for per-atom outputs or "
+            "'aggregation: mean' for intensive (averaged) outputs."
+        )
+    is_intensive = aggregation == "mean"
 
     cartesian_key = next(iter(target["type"]))
 
@@ -488,6 +523,7 @@ def _get_cartesian_target_info(target_name: str, target: DictConfig) -> TargetIn
         quantity=target["quantity"],
         unit=target["unit"],
         description=target.get("description", ""),
+        is_intensive=is_intensive,
     )
 
 
@@ -495,6 +531,20 @@ def _get_spherical_target_info(target_name: str, target: DictConfig) -> TargetIn
     sample_names = ["system"]
     if target["per_atom"]:
         sample_names.append("atom")
+
+    aggregation = target.get("aggregation", "sum")
+    if aggregation not in ("sum", "mean"):
+        raise ValueError(
+            f"Invalid aggregation '{aggregation}' for target '{target_name}'. "
+            "Supported values are 'sum' (extensive) and 'mean' (intensive)."
+        )
+    if target["per_atom"] and aggregation == "mean":
+        raise ValueError(
+            f"Target '{target_name}' cannot have both 'per_atom: true' and "
+            "'aggregation: mean'. Use 'per_atom: true' for per-atom outputs or "
+            "'aggregation: mean' for intensive (averaged) outputs."
+        )
+    is_intensive = aggregation == "mean"
 
     irreps = target["type"]["spherical"]["irreps"]
     keys = []
@@ -542,6 +592,7 @@ def _get_spherical_target_info(target_name: str, target: DictConfig) -> TargetIn
         quantity=target["quantity"],
         unit=target["unit"],
         description=target.get("description", ""),
+        is_intensive=is_intensive,
     )
 
 

@@ -316,6 +316,15 @@ class Trainer(TrainerInterface[TrainerHypers]):
         # per-atom targets:
         per_structure_targets = self.hypers["per_structure_targets"]
 
+        # intensive targets: their predictions are already averaged over atoms at model
+        # output time, so they must also be excluded from the N-atom division here
+        intensive_targets = [
+            name
+            for name, info in train_targets.items()
+            if info.is_intensive
+        ]
+        per_structure_targets = per_structure_targets + intensive_targets
+
         # Log the initial learning rate:
         old_lr = optimizer.param_groups[0]["lr"]
         logging.info(f"Initial learning rate: {old_lr}")

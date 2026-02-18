@@ -24,7 +24,7 @@ from metatrain.utils.dtype import dtype_to_str
 from metatrain.utils.long_range import DummyLongRangeFeaturizer, LongRangeFeaturizer
 from metatrain.utils.metadata import merge_metadata
 from metatrain.utils.scaler import Scaler
-from metatrain.utils.sum_over_atoms import sum_over_atoms
+from metatrain.utils.sum_over_atoms import mean_over_atoms, sum_over_atoms
 
 from . import checkpoints
 from .documentation import ModelHypers
@@ -841,9 +841,20 @@ class SoapBpnn(ModelInterface[ModelHypers]):
                     self.key_labels[output_name], blocks
                 )
 
+        num_atoms = torch.tensor(
+            [len(s) for s in systems],
+            device=systems[0].positions.device,
+            dtype=systems[0].positions.dtype,
+        )
         for output_name, atomic_property in atomic_properties.items():
             if outputs[output_name].per_atom:
                 return_dict[output_name] = atomic_property
+            elif (
+                output_name in self.dataset_info.targets
+                and self.dataset_info.targets[output_name].is_intensive
+            ):
+                # average the atomic property to get the intensive structural property
+                return_dict[output_name] = mean_over_atoms(atomic_property, num_atoms)
             else:
                 # sum the atomic property to get the total property
                 return_dict[output_name] = sum_over_atoms(atomic_property)

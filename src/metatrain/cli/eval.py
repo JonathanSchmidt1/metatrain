@@ -181,6 +181,13 @@ def _eval_targets(
     rmse_acc = RMSEAccumulator()
     mae_acc = MAEAccumulator()
 
+    # Intensive targets are already averaged at model output time; skip N-atom division
+    intensive_keys = [
+        name
+        for name, info in options.items()
+        if isinstance(info, TargetInfo) and info.is_intensive
+    ]
+
     # Warm-up
     cycled = itertools.cycle(dataloader)
     for _ in range(10):
@@ -218,10 +225,10 @@ def _eval_targets(
 
         # Update metrics
         preds_per_atom = average_by_num_atoms(
-            batch_predictions, systems, per_structure_keys=[]
+            batch_predictions, systems, per_structure_keys=intensive_keys
         )
         targ_per_atom = average_by_num_atoms(
-            batch_targets, systems, per_structure_keys=[]
+            batch_targets, systems, per_structure_keys=intensive_keys
         )
         rmse_acc.update(preds_per_atom, targ_per_atom, batch_extra_data)
         mae_acc.update(preds_per_atom, targ_per_atom, batch_extra_data)
@@ -240,8 +247,8 @@ def _eval_targets(
         writer.finish()
 
     # Finalize metrics and log
-    rmse_vals = rmse_acc.finalize(not_per_atom=["positions_gradients"])
-    mae_vals = mae_acc.finalize(not_per_atom=["positions_gradients"])
+    rmse_vals = rmse_acc.finalize(not_per_atom=["positions_gradients"] + intensive_keys)
+    mae_vals = mae_acc.finalize(not_per_atom=["positions_gradients"] + intensive_keys)
     metrics = {**rmse_vals, **mae_vals}
     metric_logger = MetricLogger(
         log_obj=logger, dataset_info=model.capabilities(), initial_metrics=metrics

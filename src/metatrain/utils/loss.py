@@ -943,6 +943,96 @@ class TensorMapGaussianCRPSLoss(TensorMapEnsembleLoss):
         )
 
 
+class TensorMapPairwiseDistanceLoss(LossInterface):
+    """
+    Pairwise-distance matching loss on :py:class:`TensorMap` feature embeddings.
+
+    For each batch of N systems, computes the L2 distance between every pair
+    (i, j) of prediction vectors and the corresponding distance between the
+    target vectors, then penalises the squared discrepancy:
+
+    .. math::
+
+        \\mathcal{L} = \\frac{1}{\\binom{N}{2}} \\sum_{i < j}
+            \\bigl(
+                \\|\\hat{f}_i - \\hat{f}_j\\|_2
+                - \\|y_i - y_j\\|_2
+            \\bigr)^2
+
+    This is invariant to global translations in the embedding space and is
+    particularly useful when training on feature embeddings where absolute
+    values carry no meaning but the relative metric structure should agree
+    with the target space.
+
+    :param name: key in the predictions/targets dict.
+    :param gradient: not supported for this loss; ignored.
+    :param weight: weight of the loss contribution in the final aggregation.
+    :param reduction: ``"mean"`` (default) or ``"sum"`` over pairs.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        gradient: Optional[str],
+        weight: float,
+        reduction: str,
+    ):
+        super().__init__(name, gradient, weight, reduction)
+
+    def compute(
+        self,
+        predictions: Dict[str, TensorMap],
+        targets: Dict[str, TensorMap],
+        extra_data: Optional[Any] = None,
+    ) -> torch.Tensor:
+        """
+        Compute the pairwise-distance matching loss.
+
+        :param predictions: mapping of names to :py:class:`TensorMap`.
+            The block values should have shape ``(N, D_pred)``.
+        :param targets: mapping of names to :py:class:`TensorMap`.
+            The block values should have shape ``(N, D_targ)``.
+        :param extra_data: ignored.
+        :return: scalar torch.Tensor loss.
+        """
+        pred_block = predictions[self.target].block()
+        targ_block = targets[self.target].block()
+
+        pred_vals = pred_block.values  # (N, D_pred)
+        targ_vals = targ_block.values  # (N, D_targ)
+
+        N = pred_vals.shape[0]
+        device = pred_vals.device
+        dtype = pred_vals.dtype
+
+        if N < 2:
+            return torch.zeros((), dtype=dtype, device=device)
+
+        # Pairwise L2 distances: (N, N)
+        # torch.cdist is numerically stable (clamps squared distances >= 0 internally)
+        pred_dists = torch.cdist(pred_vals, pred_vals.to(dtype=pred_vals.dtype))
+        targ_dists = torch.cdist(
+            targ_vals.to(dtype=dtype), targ_vals.to(dtype=dtype)
+        )
+
+        # Extract only the upper triangle (i < j) to get N*(N-1)/2 unique pairs
+        upper = torch.triu(torch.ones(N, N, dtype=torch.bool, device=device), diagonal=1)
+        pred_dists_pairs = pred_dists[upper]
+        targ_dists_pairs = targ_dists[upper]
+
+        if self.reduction == "mean":
+            return torch.nn.functional.mse_loss(pred_dists_pairs, targ_dists_pairs)
+        elif self.reduction == "sum":
+            return torch.nn.functional.mse_loss(
+                pred_dists_pairs, targ_dists_pairs, reduction="sum"
+            )
+        else:
+            raise ValueError(
+                f"Unsupported reduction '{self.reduction}' for "
+                "TensorMapPairwiseDistanceLoss. Use 'mean' or 'sum'."
+            )
+
+
 class TensorMapEmpiricalCRPSLoss(TensorMapEnsembleLoss):
     """
     Empirical CRPS loss for :py:class:`TensorMap` entries.
@@ -1185,6 +1275,7 @@ class LossType(Enum):
     GAUSSIAN_NLL = ("gaussian_nll_ensemble", TensorMapGaussianNLLLoss)
     GAUSSIAN_CRPS = ("gaussian_crps_ensemble", TensorMapGaussianCRPSLoss)
     EMPIRICAL_CRPS = ("empirical_crps_ensemble", TensorMapEmpiricalCRPSLoss)
+    PAIRWISE_DISTANCE = ("pairwise_distance", TensorMapPairwiseDistanceLoss)
 
     def __init__(self, key: str, cls: Type[LossInterface]) -> None:
         self._key = key

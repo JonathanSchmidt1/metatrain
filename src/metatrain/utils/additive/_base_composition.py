@@ -75,6 +75,7 @@ class BaseCompositionModel(torch.nn.Module):
     target_names: List[str]
     weights: Dict[str, TensorMap]
     sample_kinds: Dict[str, str]
+    intensive_outputs: List[str]
     type_to_index: torch.Tensor
     XTX: Dict[str, TensorMap]
     XTY: Dict[str, TensorMap]
@@ -83,12 +84,14 @@ class BaseCompositionModel(torch.nn.Module):
         self,
         atomic_types: Union[List[int], torch.Tensor],
         layouts: Dict[str, TensorMap],
+        intensive_outputs: Optional[List[str]] = None,
     ) -> None:
         super().__init__()
 
         self.atomic_types = torch.as_tensor(atomic_types, dtype=torch.int32)
         self.target_names = []
         self.sample_kinds = {}
+        self.intensive_outputs = [] if intensive_outputs is None else intensive_outputs
         self.XTX = {}
         self.XTY = {}
         self.weights = {}
@@ -262,6 +265,16 @@ class BaseCompositionModel(torch.nn.Module):
                         f" for target {target_name}"
                     )
                 X = X.to(device=device, dtype=dtype)
+
+                # For intensive targets the reference data is an average over atoms,
+                # but the composition model predicts a sum (X @ w). We therefore fit
+                # X @ w = Y * N_atoms so that during forward we can divide by N_atoms
+                # to recover the intensive prediction.
+                if target_name in self.intensive_outputs:
+                    num_atoms = torch.tensor(
+                        [len(s) for s in systems], device=device, dtype=dtype
+                    )
+                    Y = Y * num_atoms.view(-1, *[1] * (len(Y.shape) - 1))
 
                 # Compute "XTX", i.e. X.T @ X
                 # TODO: store XTX by sample kind instead, saving memory
@@ -470,6 +483,28 @@ class BaseCompositionModel(torch.nn.Module):
             # that aren't "system".
             if not outputs[output_name].per_atom:
                 prediction = mts.sum_over_samples(prediction, "atom")
+                # For intensive outputs the composition weights were fitted against
+                # Y * N_atoms, so divide by N_atoms to recover the intensive value.
+                if output_name in self.intensive_outputs:
+                    num_atoms = torch.tensor(
+                        [len(s) for s in systems],
+                        device=device,
+                        dtype=dtype,
+                    )
+                    new_blocks: List[TensorBlock] = []
+                    for block in prediction.blocks():
+                        new_blocks.append(
+                            TensorBlock(
+                                values=block.values
+                                / num_atoms.view(
+                                    -1, *[1] * (len(block.values.shape) - 1)
+                                ),
+                                samples=block.samples,
+                                components=block.components,
+                                properties=block.properties,
+                            )
+                        )
+                    prediction = TensorMap(prediction.keys, new_blocks)
             predictions[output_name] = prediction
 
         return predictions

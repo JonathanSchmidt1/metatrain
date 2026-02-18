@@ -24,7 +24,7 @@ from metatrain.utils.dtype import dtype_to_str
 from metatrain.utils.long_range import DummyLongRangeFeaturizer, LongRangeFeaturizer
 from metatrain.utils.metadata import merge_metadata
 from metatrain.utils.scaler import Scaler
-from metatrain.utils.sum_over_atoms import sum_over_atoms
+from metatrain.utils.sum_over_atoms import mean_over_atoms, sum_over_atoms
 
 from . import checkpoints
 from .documentation import ModelHypers
@@ -1115,12 +1115,25 @@ class PET(ModelInterface[ModelHypers]):
                 )
 
         # If per-atom predictions are requested, we return the atomic predictions
-        # tensor maps. Otherwise, we sum the atomic predictions over the atoms
-        # to get the final per-structure predictions for each requested output.
+        # tensor maps. Otherwise, we sum (or average, for intensive targets) the
+        # atomic predictions over the atoms to get the per-structure predictions.
 
+        num_atoms = torch.tensor(
+            [len(s) for s in systems],
+            device=systems[0].positions.device,
+            dtype=systems[0].positions.dtype,
+        )
         for output_name, atomic_property in atomic_predictions_tmap_dict.items():
             if outputs[output_name].per_atom:
                 atomic_predictions_tmap_dict[output_name] = atomic_property
+            elif (
+                output_name in self.dataset_info.targets
+                and self.dataset_info.targets[output_name].is_intensive
+            ):
+                # average the atomic property to get the intensive structural property
+                atomic_predictions_tmap_dict[output_name] = mean_over_atoms(
+                    atomic_property, num_atoms
+                )
             else:
                 atomic_predictions_tmap_dict[output_name] = sum_over_atoms(
                     atomic_property

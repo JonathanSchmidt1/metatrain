@@ -7,6 +7,37 @@ from . import torch_jit_script_unless_coverage
 
 
 @torch_jit_script_unless_coverage
+def mean_over_atoms(tensor_map: TensorMap, num_atoms: torch.Tensor) -> TensorMap:
+    """
+    Averages a ``TensorMap`` over atoms in each system, producing one value per system.
+
+    This is used for intensive targets, where the model predicts per-atom values that
+    should be averaged (not summed) to obtain the structural prediction.
+
+    :param tensor_map: The per-atom TensorMap to average.
+    :param num_atoms: 1-D tensor of shape ``(n_systems,)`` with the number of atoms
+        in each system.
+    :return: A new TensorMap with per-system samples and values equal to the mean of
+        the per-atom values within each system.
+    """
+    summed = sum_over_atoms(tensor_map)
+    new_blocks: List[TensorBlock] = []
+    for block in summed.blocks():
+        values = block.values / num_atoms.to(dtype=block.values.dtype).view(
+            -1, *[1] * (len(block.values.shape) - 1)
+        )
+        new_blocks.append(
+            TensorBlock(
+                values=values,
+                samples=block.samples,
+                components=block.components,
+                properties=block.properties,
+            )
+        )
+    return TensorMap(keys=summed.keys, blocks=new_blocks)
+
+
+@torch_jit_script_unless_coverage
 def sum_over_atoms(tensor_map: TensorMap) -> TensorMap:
     """
     A faster version of ``metatensor.torch.sum_over_samples``, specialized for

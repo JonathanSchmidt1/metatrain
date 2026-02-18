@@ -77,6 +77,11 @@ class CompositionModel(torch.nn.Module):
                 target_name: target_info.layout
                 for target_name, target_info in self.target_infos.items()
             },
+            intensive_outputs=[
+                target_name
+                for target_name, target_info in self.target_infos.items()
+                if target_info.is_intensive
+            ],
         )
         """The underlying composition model that handles the accumulation and fitting of
         the weights."""
@@ -324,6 +329,8 @@ class CompositionModel(torch.nn.Module):
                 continue
             self._new_outputs.append(target_name)
             self.model.add_output(target_name, target_info.layout)
+            if target_info.is_intensive:
+                self.model.intensive_outputs.append(target_name)
             self._add_output(target_name, target_info)
 
         return self
