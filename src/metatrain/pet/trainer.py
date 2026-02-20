@@ -28,7 +28,11 @@ from metatrain.utils.distributed.slurm import DistributedEnvironment
 from metatrain.utils.evaluate_model import evaluate_model
 from metatrain.utils.io import check_file_extension
 from metatrain.utils.logging import ROOT_LOGGER, MetricLogger, WandbHandler
-from metatrain.utils.loss import LossAggregator, LossSpecification
+from metatrain.utils.loss import (
+    LossAggregator,
+    LossSpecification,
+    TensorMapPairwiseDistanceLoss,
+)
 from metatrain.utils.metrics import MAEAccumulator, RMSEAccumulator, get_selected_metric
 from metatrain.utils.neighbor_lists import (
     get_requested_neighbor_lists,
@@ -317,6 +321,11 @@ class Trainer(TrainerInterface[TrainerHypers]):
         # Create a loss function:
         loss_hypers = cast(Dict[str, LossSpecification], self.hypers["loss"])  # mypy
         loss_fn = LossAggregator(targets=train_targets, config=loss_hypers)
+        pairwise_loss_terms = [
+            term
+            for term in loss_fn.losses.values()
+            if isinstance(term, TensorMapPairwiseDistanceLoss)
+        ]
         logging.info("Using the following loss functions:")
         for name, info in loss_fn.metadata.items():
             logging.info(f"{name}:")
@@ -355,6 +364,15 @@ class Trainer(TrainerInterface[TrainerHypers]):
 
         per_structure_targets = self.hypers["per_structure_targets"]
 
+        # intensive targets: their predictions are already averaged over atoms at model
+        # output time, so they must also be excluded from the N-atom division here
+        intensive_targets = [
+            name
+            for name, info in train_targets.items()
+            if info.is_intensive
+        ]
+        per_structure_targets = per_structure_targets + intensive_targets
+
         # Log the initial learning rate:
         logging.info(f"Base learning rate: {self.hypers['learning_rate']}")
 
@@ -386,6 +404,10 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 )
 
             train_loss = 0.0
+            train_pairwise_losses: Dict[str, float] = {
+                term.target: 0.0 for term in pairwise_loss_terms
+            }
+            train_pairwise_n_batches = 0
             pbar = tqdm(train_dataloader, desc=f"Epoch {epoch}", leave=True)
             for batch in pbar:
                 # Skip None batches (those outside batch_atom_bounds)
@@ -429,6 +451,12 @@ class Trainer(TrainerInterface[TrainerHypers]):
                     # sum the loss over all processes
                     torch.distributed.all_reduce(train_loss_batch)
                 train_loss += train_loss_batch.item()
+                with torch.no_grad():
+                    for pw_term in pairwise_loss_terms:
+                        train_pairwise_losses[pw_term.target] += pw_term.compute(
+                            predictions, targets
+                        ).item()
+                train_pairwise_n_batches += 1
 
                 scaled_predictions = (model.module if is_distributed else model).scaler(
                     systems, predictions
@@ -496,6 +524,17 @@ class Trainer(TrainerInterface[TrainerHypers]):
                                     wandb_data["step/forces_rmse"] = torch.sqrt(
                                         torch.mean((pg - tg) ** 2)
                                     ).item()
+                            for _, loss_term in loss_fn.losses.items():
+                                if isinstance(
+                                    loss_term, TensorMapPairwiseDistanceLoss
+                                ):
+                                    with torch.no_grad():
+                                        pw_loss = loss_term.compute(
+                                            predictions, targets
+                                        )
+                                    wandb_data[
+                                        f"step/{loss_term.target}_pairwise_loss"
+                                    ] = pw_loss.item()
                             handler.run.log(wandb_data, step=global_step)
                             break
 
@@ -509,6 +548,10 @@ class Trainer(TrainerInterface[TrainerHypers]):
                             self.hypers["log_separate_blocks"]
                         )
                     val_loss = 0.0
+                    val_pairwise_losses: Dict[str, float] = {
+                        term.target: 0.0 for term in pairwise_loss_terms
+                    }
+                    val_pairwise_n_batches = 0
                     for val_batch in val_dataloader:
                         if should_skip_batch(val_batch, is_distributed, device):
                             continue
@@ -537,6 +580,11 @@ class Trainer(TrainerInterface[TrainerHypers]):
                         if is_distributed:
                             torch.distributed.all_reduce(val_loss_batch)
                         val_loss += val_loss_batch.item()
+                        for pw_term in pairwise_loss_terms:
+                            val_pairwise_losses[pw_term.target] += pw_term.compute(
+                                predictions_v, targets_v
+                            ).item()
+                        val_pairwise_n_batches += 1
                         scaled_preds_v = (
                             model.module if is_distributed else model
                         ).scaler(systems_v, predictions_v)
@@ -593,6 +641,16 @@ class Trainer(TrainerInterface[TrainerHypers]):
                         "loss": val_loss,
                         **finalized_val_info,
                     }
+                    if train_pairwise_n_batches > 0:
+                        for target_name, total in train_pairwise_losses.items():
+                            finalized_train_info[
+                                f"pairwise_loss_{target_name}"
+                            ] = total / train_pairwise_n_batches
+                    if val_pairwise_n_batches > 0:
+                        for target_name, total in val_pairwise_losses.items():
+                            finalized_val_info[
+                                f"pairwise_loss_{target_name}"
+                            ] = total / val_pairwise_n_batches
 
                     # Initialize or log via MetricLogger
                     if metric_logger is None:

@@ -274,7 +274,10 @@ class BaseCompositionModel(torch.nn.Module):
                     num_atoms = torch.tensor(
                         [len(s) for s in systems], device=device, dtype=dtype
                     )
-                    Y = Y * num_atoms.view(-1, *[1] * (len(Y.shape) - 1))
+                    view_shape: List[int] = [-1]
+                    for _ in range(len(Y.shape) - 1):
+                        view_shape.append(1)
+                    Y = Y * num_atoms.view(view_shape)
 
                 # Compute "XTX", i.e. X.T @ X
                 # TODO: store XTX by sample kind instead, saving memory
@@ -313,9 +316,9 @@ class BaseCompositionModel(torch.nn.Module):
                 )
                 continue
 
-            if isinstance(weights, float):
-                # A float is provided for this target, which means that the same
-                # weight should be used for all atomic types.
+            if isinstance(weights, (float, int)):
+                # A float or int is provided for this target, which means that the
+                # same weight should be used for all atomic types.
                 weights = {
                     int(atomic_type): float(weights) for atomic_type in atomic_types
                 }
@@ -493,12 +496,12 @@ class BaseCompositionModel(torch.nn.Module):
                     )
                     new_blocks: List[TensorBlock] = []
                     for block in prediction.blocks():
+                        view_shape_b: List[int] = [-1]
+                        for _dim in range(len(block.values.shape) - 1):
+                            view_shape_b.append(1)
                         new_blocks.append(
                             TensorBlock(
-                                values=block.values
-                                / num_atoms.view(
-                                    -1, *[1] * (len(block.values.shape) - 1)
-                                ),
+                                values=block.values / num_atoms.view(view_shape_b),
                                 samples=block.samples,
                                 components=block.components,
                                 properties=block.properties,

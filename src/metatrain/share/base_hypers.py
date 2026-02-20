@@ -142,6 +142,12 @@ class TargetHypers(TypedDict):
     per_atom: NotRequired[bool] = False
     """Whether the target is a per-atom quantity, as opposed to a global
     (per-structure) quantity."""
+    aggregation: NotRequired[Literal["sum", "mean"]] = "sum"
+    """How to aggregate per-atom predictions into a per-structure prediction.
+
+    ``"sum"`` (default) is appropriate for extensive quantities (e.g. energy).
+    ``"mean"`` is appropriate for intensive quantities (e.g. temperature,
+    per-atom-averaged embeddings)."""
     type: NotRequired[
         ScalarTargetTypeHyper | CartesianTargetTypeHypers | SphericalTargetTypeHypers
     ]
