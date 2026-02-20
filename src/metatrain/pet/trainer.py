@@ -591,7 +591,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                             if use_bf16_autocast
                             else nullcontext()
                         )
-                        with autocast_ctx:
+                        with torch.autograd.grad_mode.inference_mode(mode=not any(target_info.gradients for target_info in train_targets.values())), autocast_ctx:
                             predictions_v = evaluate_model(
                                 model,
                                 systems_v,
@@ -607,18 +607,18 @@ class Trainer(TrainerInterface[TrainerHypers]):
                             val_loss_batch = loss_fn(
                                 predictions_v, targets_v, extra_data_v
                             )
-                        if is_distributed:
-                            torch.distributed.all_reduce(val_loss_batch)
-                        val_loss += val_loss_batch.item()
-                        scaled_preds_v = (
-                            model.module if is_distributed else model
-                        ).scaler(systems_v, predictions_v)
-                        scaled_tgts_v = (
-                            model.module if is_distributed else model
-                        ).scaler(systems_v, targets_v)
+                            if is_distributed:
+                                torch.distributed.all_reduce(val_loss_batch)
+                            val_loss += val_loss_batch.item()
+                            scaled_preds_v = (
+                                model.module if is_distributed else model
+                            ).scaler(systems_v, predictions_v)
+                            scaled_tgts_v = (
+                                model.module if is_distributed else model
+                            ).scaler(systems_v, targets_v)
                         val_rmse_calculator.update(
                             scaled_preds_v, scaled_tgts_v, extra_data_v
-                        )
+                            )
                         if self.hypers["log_mae"]:
                             val_mae_calculator.update(
                                 scaled_preds_v, scaled_tgts_v, extra_data_v
