@@ -464,10 +464,10 @@ class PET(ModelInterface[ModelHypers]):
                 for i, system in enumerate(systems):
                     if "mtt::charge" in system.known_data():
                         charges[i] = (
-                            system.get_data("mtt::charge").block().values.long()
+                            system.get_data("mtt::charge").block().values.squeeze().long()
                         )
                     if "mtt::spin" in system.known_data():
-                        spins[i] = system.get_data("mtt::spin").block().values.long()
+                        spins[i] = system.get_data("mtt::spin").block().values.squeeze().long()
                 self.system_conditioning.validate(charges, spins)
                 featurizer_inputs["charge"] = charges
                 featurizer_inputs["spin"] = spins

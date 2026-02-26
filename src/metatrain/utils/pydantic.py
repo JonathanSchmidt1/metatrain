@@ -56,7 +56,7 @@ class MetatrainValidationError(Exception):
         error_str = f"{len(self.errors)} validation errors occurred:\n"
         for i, err in enumerate(self.errors):
             error_str += (
-                f"[Error {i}] {'.'.join(err['loc'])}\n\t{self.get_error_string(err)}\n"
+                f"[Error {i}] {'.'.join(str(x) for x in err['loc'])}\n\t{self.get_error_string(err)}\n"
             )
         return error_str
 

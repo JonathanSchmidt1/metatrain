@@ -28,6 +28,7 @@ from metatrain.utils.data.writers import (
     get_writer,
 )
 from metatrain.utils.devices import pick_devices
+from metatrain.utils.distributed.slurm import DistributedEnvironment
 from metatrain.utils.errors import ArchitectureError
 from metatrain.utils.evaluate_model import evaluate_model
 from metatrain.utils.io import load_model
@@ -110,6 +111,35 @@ def _add_eval_model_parser(subparser: argparse._SubParsersAction) -> None:
         action="store_true",
         help="whether to run consistency checks (default: %(default)s)",
     )
+    parser.add_argument(
+        "--distributed",
+        dest="distributed",
+        action="store_true",
+        help=(
+            "enable distributed evaluation across multiple GPUs/nodes "
+            "(requires torchrun or SLURM launcher)"
+        ),
+    )
+    parser.add_argument(
+        "--distributed-port",
+        dest="distributed_port",
+        type=int,
+        default=29400,
+        help=(
+            "port for distributed communication (default: %(default)s); "
+            "only used with SLURM"
+        ),
+    )
+    parser.add_argument(
+        "--npy",
+        dest="npy",
+        action="store_true",
+        help=(
+            "write energy and force predictions as numpy arrays "
+            "({output}_energies_{rank}.npy, {output}_forces_{rank}.npy) "
+            "instead of an xyz file"
+        ),
+    )
 
 
 def _prepare_eval_model_args(args: argparse.Namespace) -> None:
@@ -132,6 +162,11 @@ def _eval_targets(
     batch_size: int = 1,
     check_consistency: bool = False,
     writer: Optional[Writer] = None,
+    is_distributed: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
+    device: Optional[torch.device] = None,
+    npy_output: Optional[Path] = None,
 ) -> None:
     """
     Evaluate `model` on `dataset`, accumulate RMSE/MAE, and (if `writer` is provided)
@@ -143,6 +178,13 @@ def _eval_targets(
     :param batch_size: Batch size for evaluation.
     :param check_consistency: Whether to run consistency checks during model evaluation.
     :param writer: Optional writer to write out per-sample predictions.
+    :param is_distributed: Whether to use distributed evaluation.
+    :param rank: The rank of the current process (0 for main process).
+    :param world_size: The total number of processes.
+    :param device: The device to use. If None, it will be inferred from the model.
+    :param npy_output: If set, save energy and force predictions as numpy arrays with
+        this path as the stem (e.g. ``Path("output")`` → ``output_energies_{rank}.npy``
+        and ``output_forces_{rank}.npy``). The xyz writer is not used in this mode.
     """
     if len(dataset) == 0:
         logging.info("This dataset is empty. No evaluation will be performed.")
@@ -152,14 +194,22 @@ def _eval_targets(
     model_tensor = next(itertools.chain(model.parameters(), model.buffers()))
     dtype = model_tensor.dtype
 
-    device = pick_devices(architecture_devices=model.capabilities().supported_devices)[
-        0
-    ]
-    logging.info(f"Running on device {device} with dtype {dtype}")
+    if device is None:
+        device = pick_devices(
+            architecture_devices=model.capabilities().supported_devices
+        )[0]
+
+    if rank == 0:
+        if is_distributed:
+            logging.info(
+                f"Running on {world_size} devices with dtype {dtype}"
+            )
+        else:
+            logging.info(f"Running on device {device} with dtype {dtype}")
     model.to(dtype=dtype, device=device)
 
     # DataLoader & metrics setup
-    if len(dataset) % batch_size != 0:
+    if rank == 0 and len(dataset) % batch_size != 0:
         logging.debug(
             f"The dataset size ({len(dataset)}) is not a multiple of the batch size "
             f"({batch_size}). {len(dataset) // batch_size} batches will be "
@@ -175,11 +225,22 @@ def _eval_targets(
         target_keys,
         callables=[get_system_with_neighbor_lists_transform(requested_neighbor_lists)],
     )
-    dataloader = torch.utils.data.DataLoader(
-        dataset, batch_size=batch_size, collate_fn=collate_fn, shuffle=False
-    )
+    if is_distributed:
+        sampler = torch.utils.data.DistributedSampler(
+            dataset, num_replicas=world_size, rank=rank, shuffle=False
+        )
+        dataloader = torch.utils.data.DataLoader(
+            dataset, batch_size=batch_size, collate_fn=collate_fn, sampler=sampler
+        )
+    else:
+        dataloader = torch.utils.data.DataLoader(
+            dataset, batch_size=batch_size, collate_fn=collate_fn, shuffle=False
+        )
     rmse_acc = RMSEAccumulator()
     mae_acc = MAEAccumulator()
+
+    # Buffers for npy output: safe_key -> list of per-batch arrays
+    npy_buffers: Dict[str, list] = {}
 
     # Warm-up
     cycled = itertools.cycle(dataloader)
@@ -198,7 +259,7 @@ def _eval_targets(
     timings_per_atom = []
 
     # Main evaluation loop
-    for batch in tqdm.tqdm(dataloader, ncols=100):
+    for batch in tqdm.tqdm(dataloader, ncols=100, disable=(rank != 0)):
         systems, batch_targets, batch_extra_data = unpack_batch(batch)
         systems, batch_targets, batch_extra_data = batch_to(
             systems, batch_targets, batch_extra_data, dtype=dtype, device=device
@@ -226,8 +287,33 @@ def _eval_targets(
         rmse_acc.update(preds_per_atom, targ_per_atom, batch_extra_data)
         mae_acc.update(preds_per_atom, targ_per_atom, batch_extra_data)
 
-        # Write out each sample if a writer is configured
-        if writer:
+        if npy_output is not None:
+            for key, pred_tm in batch_predictions.items():
+                # Sanitize key for use as a filename component
+                safe_key = key.replace("::", "__").replace(" ", "_")
+                # Concatenate values across all blocks
+                all_values = torch.cat(
+                    [pred_tm.block(i).values for i in range(len(pred_tm))], dim=0
+                )
+                npy_buffers.setdefault(safe_key, []).append(
+                    all_values.detach().cpu().numpy()
+                )
+                # Collect gradients from all blocks
+                for grad_name in pred_tm.block(0).gradients_list():
+                    grad_values = torch.cat(
+                        [
+                            pred_tm.block(i).gradient(grad_name).values
+                            for i in range(len(pred_tm))
+                        ],
+                        dim=0,
+                    )
+                    if grad_name == "positions":
+                        grad_values = -grad_values  # dE/dx -> force
+                    safe_grad_key = f"{safe_key}_{grad_name}_gradients"
+                    npy_buffers.setdefault(safe_grad_key, []).append(
+                        grad_values.detach().cpu().numpy()
+                    )
+        elif writer is not None:
             writer.write(systems, batch_predictions)
 
         # Timing
@@ -235,28 +321,47 @@ def _eval_targets(
         total_time += time_taken
         timings_per_atom.append(time_taken / sum(len(system) for system in systems))
 
-    # Finish writer
-    if writer:
+    # Finish xyz writer
+    if writer is not None:
         writer.finish()
 
-    # Finalize metrics and log
-    rmse_vals = rmse_acc.finalize(not_per_atom=["positions_gradients"])
-    mae_vals = mae_acc.finalize(not_per_atom=["positions_gradients"])
-    metrics = {**rmse_vals, **mae_vals}
-    metric_logger = MetricLogger(
-        log_obj=logger, dataset_info=model.capabilities(), initial_metrics=metrics
-    )
-    metric_logger.log(metrics)
+    # Save npy arrays (one file per key per rank)
+    if npy_output is not None:
+        rank_suffix = f"_{rank}" if is_distributed else ""
+        for buf_key, chunks in npy_buffers.items():
+            arr = np.concatenate(chunks, axis=0)
+            path = f"{npy_output}_{buf_key}{rank_suffix}.npy"
+            np.save(path, arr)
+            logging.info(f"Saved {buf_key} to {path} ({arr.shape[0]} samples)")
 
-    # Log timings
-    timings_per_atom = np.array(timings_per_atom)
-    mean_per_atom = np.mean(timings_per_atom)
-    std_per_atom = np.std(timings_per_atom)
-    logging.info(
-        f"Evaluation time: {total_time:.2f} s "
-        f"[{1000.0 * mean_per_atom:.4f} ± "
-        f"{1000.0 * std_per_atom:.4f} ms per atom]"
+    # Finalize metrics (all_reduce across ranks if distributed) and log on rank 0
+    rmse_vals = rmse_acc.finalize(
+        not_per_atom=["positions_gradients"],
+        is_distributed=is_distributed,
+        device=device,
     )
+    mae_vals = mae_acc.finalize(
+        not_per_atom=["positions_gradients"],
+        is_distributed=is_distributed,
+        device=device,
+    )
+
+    if rank == 0:
+        metrics = {**rmse_vals, **mae_vals}
+        metric_logger = MetricLogger(
+            log_obj=logger, dataset_info=model.capabilities(), initial_metrics=metrics
+        )
+        metric_logger.log(metrics)
+
+        # Log timings
+        timings_per_atom = np.array(timings_per_atom)
+        mean_per_atom = np.mean(timings_per_atom)
+        std_per_atom = np.std(timings_per_atom)
+        logging.info(
+            f"Evaluation time: {total_time:.2f} s "
+            f"[{1000.0 * mean_per_atom:.4f} ± "
+            f"{1000.0 * std_per_atom:.4f} ms per atom]"
+        )
 
 
 def eval_model(
@@ -266,6 +371,9 @@ def eval_model(
     batch_size: int = 1,
     check_consistency: bool = False,
     append: Optional[bool] = None,
+    distributed: bool = False,
+    distributed_port: int = 29400,
+    npy: bool = False,
 ) -> None:
     """
     Evaluate an exported model on a given data set.
@@ -280,28 +388,71 @@ def eval_model(
     :param batch_size: Batch size for evaluation.
     :param check_consistency: Whether to run consistency checks during model evaluation.
     :param append: If ``True``, open the output file in append mode.
+    :param distributed: Whether to use distributed evaluation across multiple GPUs/nodes.
+    :param distributed_port: Port for distributed communication (SLURM only).
+    :param npy: If ``True``, write energy and force predictions as numpy arrays instead
+        of an xyz file.
     """
-    logging.info("Setting up evaluation set.")
+    # Set up distributed environment if requested
+    rank = 0
+    world_size = 1
+    device = None
+
+    if distributed:
+        from metatrain.utils.distributed.slurm import is_slurm
+
+        if is_slurm():
+            distr_env = DistributedEnvironment(distributed_port)
+            device_number = distr_env.local_rank % torch.cuda.device_count()
+            device = torch.device("cuda", device_number)
+            torch.distributed.init_process_group(backend="nccl", device_id=device)
+        else:
+            # torchrun sets RANK, LOCAL_RANK, WORLD_SIZE automatically
+            torch.distributed.init_process_group(backend="nccl")
+            local_rank = int(torch.distributed.get_rank() % torch.cuda.device_count())
+            device = torch.device("cuda", local_rank)
+
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+        logging.info(
+            f"Distributed eval: rank {rank}/{world_size} on device {device}"
+        )
+
+    if rank == 0:
+        logging.info("Setting up evaluation set.")
     output = Path(output) if isinstance(output, str) else output
 
     options_list = expand_dataset_config(options)
     for i, options in enumerate(options_list):
         idx_suffix = f"_{i}" if len(options_list) > 1 else ""
         extra_log_message = f" with index {i}" if len(options_list) > 1 else ""
-        logging.info(f"Evaluating dataset{extra_log_message}")
+        if rank == 0:
+            logging.info(f"Evaluating dataset{extra_log_message}")
         filename = f"{output.stem}{idx_suffix}{output.suffix}"
 
-        # pick the right writer
-        writer = get_writer(filename, capabilities=model.capabilities(), append=append)
+        # Determine writer and npy_output for this rank
+        if npy:
+            # npy mode: no xyz writer; each rank saves its own npy files
+            writer = None
+            npy_output = Path(f"{output.stem}{idx_suffix}")
+        elif distributed:
+            # per-rank xyz files: output_0.xyz, output_1.xyz, ...
+            rank_filename = (
+                f"{output.stem}{idx_suffix}_{rank}{output.suffix}"
+            )
+            writer = get_writer(
+                rank_filename, capabilities=model.capabilities(), append=append
+            )
+            npy_output = None
+        else:
+            writer = get_writer(
+                filename, capabilities=model.capabilities(), append=append
+            )
+            npy_output = None
 
         # build the dataset & target-info
         if hasattr(options, "targets"):
             eval_dataset, eval_info_dict, _ = get_dataset(options)
-            eval_systems = (
-                [d.system for d in eval_dataset]
-                if not isinstance(writer, DiskDatasetWriter)
-                else None
-            )
         else:
             if isinstance(writer, DiskDatasetWriter):
                 raise ValueError(
@@ -324,8 +475,6 @@ def eval_model(
 
         # run evaluation & writing
         try:
-            # we always let the writer handle I/O, so we never need return_predictions
-            # here
             _eval_targets(
                 model=model,
                 dataset=eval_dataset,
@@ -333,11 +482,19 @@ def eval_model(
                 batch_size=batch_size,
                 check_consistency=check_consistency,
                 writer=writer,
+                is_distributed=distributed,
+                rank=rank,
+                world_size=world_size,
+                device=device,
+                npy_output=npy_output,
             )
         except Exception as e:
             raise ArchitectureError(e)
 
         # no post-call write_predictions necessary anymore-writer did it all
+
+    if distributed:
+        torch.distributed.destroy_process_group()
 
 
 def _get_energy_layout(strain_gradient: bool) -> TensorMap:
