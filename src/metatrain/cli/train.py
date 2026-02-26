@@ -492,6 +492,7 @@ def train_model(
                     f"The file {restart_from} does not contain a valid checkpoint for "
                     f"the '{architecture_name}' architecture"
                 ) from e
+            _apply_new_model_hypers(model, hypers.get("model", {}))
             model = model.restart(dataset_info)
             try:
                 trainer = trainer_from_checkpoint(
@@ -516,6 +517,7 @@ def train_model(
                     f"The file {restart_from} does not contain a valid checkpoint for "
                     f"the '{architecture_name}' architecture"
                 ) from e
+            _apply_new_model_hypers(model, hypers.get("model", {}))
             model = model.restart(dataset_info)
             trainer = Trainer(hypers["training"])
         else:
@@ -671,6 +673,25 @@ def train_model(
             dataset_info.targets,
             batch_size=batch_size,
         )
+
+
+def _apply_new_model_hypers(model: torch.nn.Module, new_model_hypers: Union[Dict, DictConfig]) -> None:
+    """Propagate selected model hypers from the new config onto a loaded checkpoint.
+
+    Called before ``model.restart()`` so that architecture-specific settings that were
+    absent in the old checkpoint (e.g. ``shared_targets`` added in a later version) are
+    honoured when new outputs are registered.
+
+    Only safe-to-override settings that affect ``restart()`` behaviour are updated; the
+    bulk of the architecture hypers (layer sizes, etc.) are intentionally left as-is to
+    stay compatible with the loaded weights.
+    """
+    # shared_targets: tells restart() which new targets should reuse an existing
+    # target's head features rather than getting independent heads.
+    if hasattr(model, "shared_feature_source") and "shared_targets" in new_model_hypers:
+        new_shared = dict(new_model_hypers["shared_targets"])
+        model.hypers["shared_targets"] = new_shared
+        model.shared_feature_source = new_shared
 
 
 def _get_batch_size_from_hypers(hypers: Union[Dict, DictConfig]) -> Optional[int]:
