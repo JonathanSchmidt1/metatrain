@@ -178,6 +178,13 @@ class Scaler(torch.nn.Module):
             if len(targets) == 0:
                 break
 
+            # When restarting, the dataloader yields all merged targets (old + new),
+            # but self.target_infos only contains targets that need new scale fitting.
+            # Drop targets whose scales are already fitted to avoid a KeyError.
+            targets = {k: v for k, v in targets.items() if k in self.target_infos}
+            if len(targets) == 0:
+                continue
+
             # remove additive contributions from these targets
             for additive_model in additive_models:
                 targets = remove_additive(
