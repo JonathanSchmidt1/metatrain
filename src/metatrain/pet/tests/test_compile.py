@@ -737,3 +737,286 @@ class TestTrainingCompileAdaptive(TrainingTests, PETTests):
         hypers["training"]["compile"] = True
         hypers["model"]["num_neighbors_adaptive"] = 16
         return hypers
+
+
+# ---------------------------------------------------------------------------
+# Shared-target tests
+# ---------------------------------------------------------------------------
+
+
+def _make_shared_target_model():
+    """Create a minimal PET model with energy + one shared-feature target."""
+    from omegaconf import OmegaConf
+
+    from metatrain.pet import PET
+    from metatrain.utils.data import DatasetInfo
+    from metatrain.utils.data.target_info import (
+        get_energy_target_info,
+        get_generic_target_info,
+    )
+
+    from . import MODEL_HYPERS
+
+    torch.manual_seed(0)
+    hypers = copy.deepcopy(MODEL_HYPERS)
+    hypers["shared_targets"] = {"mace_features": "mtt::U0"}
+
+    targets = {
+        "mtt::U0": get_energy_target_info(
+            "mtt::U0", {"quantity": "energy", "unit": "eV"}
+        ),
+        "mace_features": get_generic_target_info(
+            "mace_features",
+            OmegaConf.create(
+                {
+                    "quantity": "",
+                    "unit": "",
+                    "description": "",
+                    "per_atom": True,
+                    "type": "scalar",
+                    "num_subtargets": 4,
+                }
+            ),
+        ),
+    }
+    dataset_info = DatasetInfo(
+        length_unit="Angstrom", atomic_types=[1, 6, 7, 8], targets=targets
+    )
+    model = PET(hypers, dataset_info)
+    return model
+
+
+def test_shared_targets_no_independent_heads():
+    """Shared targets must not have their own node/edge heads."""
+    model = _make_shared_target_model()
+    assert "mtt::U0" in model.node_heads, "energy must have node heads"
+    assert "mace_features" not in model.node_heads, (
+        "shared target must not have independent node heads"
+    )
+    assert "mace_features" not in model.edge_heads, (
+        "shared target must not have independent edge heads"
+    )
+    assert "mace_features" in model.node_last_layers, (
+        "shared target must have its own final node linear layers"
+    )
+    assert "mace_features" in model.edge_last_layers, (
+        "shared target must have its own final edge linear layers"
+    )
+
+
+def test_shared_targets_forward_shapes():
+    """Shared target predictions have the correct per-atom shape."""
+    from metatrain.utils.data.readers import read_systems
+    from metatrain.utils.neighbor_lists import get_system_with_neighbor_lists
+
+    from . import DATASET_PATH
+
+    model = _make_shared_target_model()
+    model.eval()
+
+    systems = read_systems(DATASET_PATH)[:2]
+    systems = [s.to(torch.float32) for s in systems]
+    for s in systems:
+        get_system_with_neighbor_lists(s, model.requested_neighbor_lists())
+
+    n_atoms = sum(len(s.positions) for s in systems)
+    output = model(
+        systems,
+        {
+            "mtt::U0": ModelOutput(quantity="energy", unit="", per_atom=False),
+            "mace_features": ModelOutput(per_atom=True),
+        },
+    )
+
+    assert "mtt::U0" in output
+    assert "mace_features" in output
+    feat_values = output["mace_features"].block().values
+    assert feat_values.shape == (n_atoms, 4), (
+        f"expected ({n_atoms}, 4), got {feat_values.shape}"
+    )
+
+
+def test_shared_targets_forward_from_batch():
+    """_forward_from_batch returns the shared target in its output dict."""
+    from metatrain.utils.data.readers import read_systems
+    from metatrain.utils.neighbor_lists import get_system_with_neighbor_lists
+
+    from ..modules.structures import systems_to_batch
+    from . import DATASET_PATH
+
+    model = _make_shared_target_model()
+    model.eval()
+
+    systems = read_systems(DATASET_PATH)[:2]
+    systems = [s.to(torch.float32) for s in systems]
+    for s in systems:
+        get_system_with_neighbor_lists(s, model.requested_neighbor_lists())
+
+    (
+        element_indices_nodes,
+        element_indices_neighbors,
+        edge_vectors,
+        edge_distances,
+        padding_mask,
+        reverse_neighbor_index,
+        cutoff_factors,
+        *_,
+    ) = systems_to_batch(
+        systems,
+        model.requested_nl,
+        model.atomic_types,
+        model.species_to_species_index,
+        model.cutoff_function,
+        model.cutoff_width,
+        model.num_neighbors_adaptive,
+    )
+
+    batch_output = model._forward_from_batch(
+        element_indices_nodes,
+        element_indices_neighbors,
+        edge_vectors,
+        edge_distances,
+        padding_mask,
+        reverse_neighbor_index,
+        cutoff_factors,
+    )
+
+    assert "mace_features" in batch_output, (
+        "shared target must appear in _forward_from_batch output"
+    )
+    feat_key = next(iter(model.output_shapes["mace_features"]))
+    n_atoms = element_indices_nodes.shape[0]
+    assert batch_output["mace_features"][feat_key].shape == (n_atoms, 4)
+
+
+def test_shared_targets_no_position_gradients():
+    """Loss on a shared target must not create .grad on edge_vectors
+    when forces are not requested for it."""
+    from metatrain.utils.data.readers import read_systems
+    from metatrain.utils.neighbor_lists import get_system_with_neighbor_lists
+
+    from ..modules.structures import systems_to_batch
+    from . import DATASET_PATH
+
+    model = _make_shared_target_model()
+    model.train()
+
+    systems = read_systems(DATASET_PATH)[:2]
+    systems = [s.to(torch.float32) for s in systems]
+    for s in systems:
+        get_system_with_neighbor_lists(s, model.requested_neighbor_lists())
+
+    (
+        element_indices_nodes,
+        element_indices_neighbors,
+        edge_vectors,
+        edge_distances,
+        padding_mask,
+        reverse_neighbor_index,
+        cutoff_factors,
+        *_,
+    ) = systems_to_batch(
+        systems,
+        model.requested_nl,
+        model.atomic_types,
+        model.species_to_species_index,
+        model.cutoff_function,
+        model.cutoff_width,
+        model.num_neighbors_adaptive,
+    )
+
+    # Do NOT set edge_vectors.requires_grad_(True); forces are not needed
+    batch_output = model._forward_from_batch(
+        element_indices_nodes,
+        element_indices_neighbors,
+        edge_vectors,
+        edge_distances,
+        padding_mask,
+        reverse_neighbor_index,
+        cutoff_factors,
+    )
+
+    feat_key = next(iter(model.output_shapes["mace_features"]))
+    feat_preds = batch_output["mace_features"][feat_key]
+    loss = feat_preds.sum()
+    loss.backward()
+
+    assert edge_vectors.grad is None, (
+        "shared target loss must not create gradients w.r.t. edge_vectors "
+        "(i.e. no position gradients)"
+    )
+
+
+def test_shared_targets_compile():
+    """compile_pet_model works with a shared-feature target present."""
+    from omegaconf import OmegaConf
+    from torch.utils.data import DataLoader
+
+    from metatrain.pet import PET
+    from metatrain.utils.data import CollateFn, Dataset, DatasetInfo
+    from metatrain.utils.data.readers import read_systems, read_targets
+    from metatrain.utils.data.target_info import get_generic_target_info
+    from metatrain.utils.neighbor_lists import (
+        get_system_with_neighbor_lists_transform,
+    )
+
+    from ..modules.compile import compile_pet_model
+    from . import DATASET_PATH, MODEL_HYPERS
+
+    torch.manual_seed(42)
+
+    conf = {
+        "mtt::U0": {
+            "quantity": "energy",
+            "read_from": DATASET_PATH,
+            "reader": "ase",
+            "key": "U0",
+            "unit": "eV",
+            "type": "scalar",
+            "per_atom": False,
+            "num_subtargets": 1,
+            "forces": False,
+            "stress": False,
+            "virial": False,
+        }
+    }
+    targets_data, targets_info = read_targets(OmegaConf.create(conf))
+
+    targets_info["mace_features"] = get_generic_target_info(
+        "mace_features",
+        OmegaConf.create(
+            {
+                "quantity": "",
+                "unit": "",
+                "description": "",
+                "per_atom": True,
+                "type": "scalar",
+                "num_subtargets": 4,
+            }
+        ),
+    )
+
+    hypers = copy.deepcopy(MODEL_HYPERS)
+    hypers["shared_targets"] = {"mace_features": "mtt::U0"}
+
+    dataset_info = DatasetInfo(
+        length_unit="Angstrom", atomic_types=[1, 6, 7, 8], targets=targets_info
+    )
+    model = PET(hypers, dataset_info)
+
+    raw_systems = read_systems(DATASET_PATH)[:4]
+    targets_data["mtt::U0"] = targets_data["mtt::U0"][:4]
+    dataset = Dataset.from_dict(
+        {"system": raw_systems, "mtt::U0": targets_data["mtt::U0"]}
+    )
+    collate_fn = CollateFn(
+        target_keys=["mtt::U0"],
+        callables=[
+            get_system_with_neighbor_lists_transform(model.requested_neighbor_lists()),
+        ],
+    )
+    dataloader = DataLoader(dataset, batch_size=4, shuffle=False, collate_fn=collate_fn)
+
+    # This should not raise — compile_pet_model must handle shared targets
+    compiled, _, _ = compile_pet_model(model, dataloader, False, False)
+    assert compiled is not None
