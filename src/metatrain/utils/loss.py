@@ -364,6 +364,170 @@ class TensorMapHuberLoss(BaseTensorMapLoss):
         )
 
 
+class GlobalSignInvariantLoss(BaseTensorMapLoss):
+    """
+    Per-atom loss invariant to a simultaneous sign flip of all targets within
+    a structure.
+
+    For each structure in the batch the sign of the reference target is chosen
+    as ``sign = +1`` if ``dot(prediction, target) >= 0`` else ``-1``, so that
+    the loss is ``min(loss(p, m), loss(p, -m))``.  When all targets in a
+    structure are zero both candidates are identical and the regular loss is
+    used unchanged.
+
+    Only meaningful for per-atom scalar targets whose samples contain a
+    ``"system"`` column identifying which structure each atom belongs to.
+
+    :param name: key in the predictions/targets dict.
+    :param gradient: optional gradient field name (typically ``None`` for this
+        loss since position gradients are not meaningful for spin targets).
+    :param weight: weight of the loss contribution in the final aggregation.
+    :param reduction: reduction mode for torch loss.
+    :param loss_fn: pre-instantiated :py:class:`torch.nn` loss.
+    """
+
+    @staticmethod
+    def _align_block_signs(
+        pred_block: TensorBlock, targ_block: TensorBlock
+    ) -> TensorBlock:
+        """Return a copy of *targ_block* with per-structure sign aligned to *pred_block*.
+
+        :param pred_block: block of model predictions.
+        :param targ_block: block of reference targets.
+        :return: new :py:class:`TensorBlock` with aligned target values.
+        """
+        p_vals = pred_block.values  # [n_atoms, n_props]
+        t_vals = targ_block.values  # [n_atoms, n_props]
+
+        if p_vals.numel() == 0:
+            return targ_block
+
+        system_col = pred_block.samples.column("system").long()
+        n_struct = int(system_col.max().item()) + 1
+
+        # Per-structure dot product: sum over atoms and properties
+        dot = torch.zeros(n_struct, dtype=p_vals.dtype, device=p_vals.device)
+        dot.scatter_add_(0, system_col, (p_vals * t_vals).sum(dim=-1))
+
+        # +1 where dot >= 0 (keep sign), -1 where dot < 0 (flip target sign)
+        sign_per_atom = torch.where(
+            dot[system_col] >= 0,
+            p_vals.new_ones(p_vals.shape[0]),
+            -p_vals.new_ones(p_vals.shape[0]),
+        )  # [n_atoms]
+
+        return TensorBlock(
+            values=t_vals * sign_per_atom.unsqueeze(-1),
+            samples=targ_block.samples,
+            components=targ_block.components,
+            properties=targ_block.properties,
+        )
+
+    def compute(
+        self,
+        predictions: Dict[str, TensorMap],
+        targets: Dict[str, TensorMap],
+        extra_data: Optional[Any] = None,
+    ) -> torch.Tensor:
+        """
+        Compute the sign-invariant loss.
+
+        :param predictions: mapping from target names to :py:class:`TensorMap`.
+        :param targets: mapping from target names to :py:class:`TensorMap`.
+        :param extra_data: ignored.
+        :return: scalar loss tensor.
+        """
+        pred_tmap = predictions[self.target]
+        targ_tmap = targets[self.target]
+
+        aligned_blocks = [
+            self._align_block_signs(pred_tmap.block(key), targ_tmap.block(key))
+            for key in pred_tmap.keys
+        ]
+        aligned_tmap = TensorMap(keys=targ_tmap.keys, blocks=aligned_blocks)
+        return self.compute_flattened(pred_tmap, aligned_tmap)
+
+
+class GlobalSignInvariantMSELoss(GlobalSignInvariantLoss):
+    """
+    Mean-squared error invariant to a global sign flip of all targets per structure.
+
+    :param name: key in the predictions/targets dict.
+    :param gradient: optional gradient field name.
+    :param weight: weight of the loss contribution in the final aggregation.
+    :param reduction: reduction mode for torch loss.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        gradient: Optional[str],
+        weight: float,
+        reduction: str,
+    ):
+        super().__init__(
+            name,
+            gradient,
+            weight,
+            reduction,
+            loss_fn=torch.nn.MSELoss(reduction=reduction),
+        )
+
+
+class GlobalSignInvariantMAELoss(GlobalSignInvariantLoss):
+    """
+    Mean-absolute error invariant to a global sign flip of all targets per structure.
+
+    :param name: key in the predictions/targets dict.
+    :param gradient: optional gradient field name.
+    :param weight: weight of the loss contribution in the final aggregation.
+    :param reduction: reduction mode for torch loss.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        gradient: Optional[str],
+        weight: float,
+        reduction: str,
+    ):
+        super().__init__(
+            name,
+            gradient,
+            weight,
+            reduction,
+            loss_fn=torch.nn.L1Loss(reduction=reduction),
+        )
+
+
+class GlobalSignInvariantHuberLoss(GlobalSignInvariantLoss):
+    """
+    Huber loss invariant to a global sign flip of all targets per structure.
+
+    :param name: key in the predictions/targets dict.
+    :param gradient: optional gradient field name.
+    :param weight: weight of the loss contribution in the final aggregation.
+    :param reduction: reduction mode for torch loss.
+    :param delta: threshold parameter for HuberLoss.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        gradient: Optional[str],
+        weight: float,
+        reduction: str,
+        delta: float,
+    ):
+        super().__init__(
+            name,
+            gradient,
+            weight,
+            reduction,
+            loss_fn=torch.nn.HuberLoss(reduction=reduction, delta=delta),
+        )
+
+
 class TensorMapMaskedMSELoss(MaskedTensorMapLoss):
     """
     Masked mean-squared error on :py:class:`TensorMap` entries.
@@ -1185,6 +1349,9 @@ class LossType(Enum):
     GAUSSIAN_NLL = ("gaussian_nll_ensemble", TensorMapGaussianNLLLoss)
     GAUSSIAN_CRPS = ("gaussian_crps_ensemble", TensorMapGaussianCRPSLoss)
     EMPIRICAL_CRPS = ("empirical_crps_ensemble", TensorMapEmpiricalCRPSLoss)
+    GLOBAL_SIGN_MSE = ("global_sign_mse", GlobalSignInvariantMSELoss)
+    GLOBAL_SIGN_MAE = ("global_sign_mae", GlobalSignInvariantMAELoss)
+    GLOBAL_SIGN_HUBER = ("global_sign_huber", GlobalSignInvariantHuberLoss)
 
     def __init__(self, key: str, cls: Type[LossInterface]) -> None:
         self._key = key

@@ -161,9 +161,28 @@ class PET(ModelInterface[ModelHypers]):
         self.component_labels: Dict[str, List[List[Labels]]] = {}
         self.target_names: List[str] = []
         self.last_layer_parameter_names: Dict[str, List[str]] = {}  # for LLPR
+        # Mapping from target name to source target name for shared last-layer features.
+        # Shared targets reuse the source's head MLP outputs instead of having their own
+        # independent node/edge heads, but still have their own final linear layers.
+        self.shared_feature_source: Dict[str, str] = dict(
+            self.hypers.get("shared_targets", {})
+        )
         for target_name, target_info in dataset_info.targets.items():
             self.target_names.append(target_name)
             self._add_output(target_name, target_info)
+
+        # Validate that all source and target names in shared_feature_source exist
+        for shared_name, source_name in self.shared_feature_source.items():
+            if shared_name not in self.target_names:
+                raise ValueError(
+                    f"'shared_targets' key '{shared_name}' is not in the training "
+                    f"targets. Available targets: {list(self.target_names)}"
+                )
+            if source_name not in self.target_names:
+                raise ValueError(
+                    f"Shared target '{shared_name}' references source '{source_name}' "
+                    f"which is not in the training targets: {list(self.target_names)}"
+                )
 
         self.register_buffer(
             "species_to_species_index",
@@ -911,6 +930,15 @@ class PET(ModelInterface[ModelHypers]):
                     edge_head(edge_features_list[i])
                 )
 
+        # Shared-feature targets reuse the source target's already-computed features
+        for target_name, source_name in self.shared_feature_source.items():
+            node_last_layer_features_dict[target_name] = (
+                node_last_layer_features_dict[source_name]
+            )
+            edge_last_layer_features_dict[target_name] = (
+                edge_last_layer_features_dict[source_name]
+            )
+
         return node_last_layer_features_dict, edge_last_layer_features_dict
 
     def _get_output_last_layer_features(
@@ -1302,29 +1330,31 @@ class PET(ModelInterface[ModelHypers]):
             description=target_info.description,
         )
 
-        self.node_heads[target_name] = torch.nn.ModuleList(
-            [
-                torch.nn.Sequential(
-                    torch.nn.Linear(self.d_node, self.d_head),
-                    torch.nn.SiLU(),
-                    torch.nn.Linear(self.d_head, self.d_head),
-                    torch.nn.SiLU(),
-                )
-                for _ in range(self.num_readout_layers)
-            ]
-        )
+        # Shared targets reuse the source target's head outputs; skip independent heads
+        if target_name not in self.shared_feature_source:
+            self.node_heads[target_name] = torch.nn.ModuleList(
+                [
+                    torch.nn.Sequential(
+                        torch.nn.Linear(self.d_node, self.d_head),
+                        torch.nn.SiLU(),
+                        torch.nn.Linear(self.d_head, self.d_head),
+                        torch.nn.SiLU(),
+                    )
+                    for _ in range(self.num_readout_layers)
+                ]
+            )
 
-        self.edge_heads[target_name] = torch.nn.ModuleList(
-            [
-                torch.nn.Sequential(
-                    torch.nn.Linear(self.d_pet, self.d_head),
-                    torch.nn.SiLU(),
-                    torch.nn.Linear(self.d_head, self.d_head),
-                    torch.nn.SiLU(),
-                )
-                for _ in range(self.num_readout_layers)
-            ]
-        )
+            self.edge_heads[target_name] = torch.nn.ModuleList(
+                [
+                    torch.nn.Sequential(
+                        torch.nn.Linear(self.d_pet, self.d_head),
+                        torch.nn.SiLU(),
+                        torch.nn.Linear(self.d_head, self.d_head),
+                        torch.nn.SiLU(),
+                    )
+                    for _ in range(self.num_readout_layers)
+                ]
+            )
 
         self.node_last_layers[target_name] = torch.nn.ModuleList(
             [

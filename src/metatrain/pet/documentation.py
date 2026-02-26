@@ -155,6 +155,23 @@ class ModelHypers(TypedDict):
     """Use ZBL potential for short-range repulsion"""
     long_range: LongRangeHypers = init_with_defaults(LongRangeHypers)
     """Long-range Coulomb interactions parameters."""
+    shared_targets: dict[str, str] = {}
+    """Mapping from target name to source target name for shared last-layer features.
+
+    Shared targets reuse the source target's last-layer features (the ``d_head``-
+    dimensional output of the head MLP) for their own final linear prediction layer,
+    rather than having independent node/edge heads. The source target (e.g.,
+    ``energy``) must also be present in the training set.
+
+    Shared targets do not support position or strain gradients (no forces/stress
+    supervision). They can be per-atom or per-structure targets.
+
+    Example — predict ``mace_features`` from the energy head's last-layer features::
+
+        shared_targets:
+          mace_features: energy
+          pet_mad_features: energy
+    """
 
 
 class TrainerHypers(TypedDict):
