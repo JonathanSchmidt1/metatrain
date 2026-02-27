@@ -369,8 +369,8 @@ class BaseCompositionModel(torch.nn.Module):
                     XTY_shape = XTY_values.shape
                     if len(XTY_values.shape) != 2:
                         XTY_values = XTY_values.reshape(XTY_values.shape[0], -1)
-                    weight_vals = _solve_linear_system(XTX_values, XTY_values)
-                    weight_vals = weight_vals.reshape(*XTY_shape)
+                    #weight_vals = _solve_linear_system(XTX_values, XTY_values)
+                    weight_vals = torch.zeros(*XTY_shape)*1.0
 
                 blocks.append(
                     TensorBlock(

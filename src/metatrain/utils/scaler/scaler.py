@@ -169,7 +169,7 @@ class Scaler(torch.nn.Module):
         #     datasets, batch_size, is_distributed=is_distributed
         # )
         #
-        # device = self.dummy_buffer.device
+        device = self.dummy_buffer.device
         #
         # for batch in dataloader:
         #     systems, targets, extra_data = unpack_batch(batch)
