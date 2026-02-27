@@ -194,8 +194,13 @@ class TrainerHypers(TypedDict):
     """Learning rate."""
     weight_decay: Optional[float] = None
 
-    log_interval: int = 1
-    """Interval to log metrics."""
+    log_interval: float = 1.0
+    """Interval to log metrics, in units of epochs. Fractional values enable
+    sub-epoch logging (e.g., 0.1 logs training metrics every 10% of an epoch).
+    Values >= 1 are interpreted as epoch counts."""
+    validation_interval: float = 1.0
+    """Interval to run validation, in units of epochs. Fractional values enable
+    sub-epoch validation (e.g., 0.5 validates twice per epoch)."""
     checkpoint_interval: int = 100
     """Interval to save checkpoints."""
     atomic_baseline: FixedCompositionWeights = {}
@@ -263,6 +268,17 @@ class TrainerHypers(TypedDict):
     counts outside these bounds will be skipped during training. Use ``None`` for
     either value to disable that bound. This is useful for preventing out-of-memory
     errors and ensuring consistent computational load. Default: ``[None, None]``."""
+    profile_step_timing: bool = False
+    """Enable step-level timing breakdown logs per epoch.
+
+    Reports average time spent in major training stages (dataloader wait, forward/loss,
+    backward/optimizer, metrics/logging), helping identify bottlenecks.
+    """
+    profile_step_timing_sync_cuda: bool = False
+    """Synchronize CUDA when collecting step timing metrics.
+
+    Makes GPU timings more accurate but adds overhead; use only for profiling runs.
+    """
 
     finetune: NoFinetuneHypers | FinetuneHypers = {
         "read_from": None,
