@@ -136,10 +136,27 @@ class BaseModel(torch.nn.Module):
 
         # Heads and last layers
         self.head_types = self.hypers["heads"]
+        self.shared_feature_source: Dict[str, str] = dict(
+            hypers.get("shared_targets", {})
+        )
         self.heads = torch.nn.ModuleDict()
         self.last_layers = torch.nn.ModuleDict()
+        target_names = list(dataset_info.targets.keys())
         for target_name, target_info in dataset_info.targets.items():
             self._add_output(target_name, target_info)
+
+        # Validate shared_targets references
+        for shared_name, source_name in self.shared_feature_source.items():
+            if shared_name not in target_names:
+                raise ValueError(
+                    f"'shared_targets' key '{shared_name}' is not in the training "
+                    f"targets. Available targets: {target_names}"
+                )
+            if source_name not in target_names:
+                raise ValueError(
+                    f"Shared target '{shared_name}' references source '{source_name}' "
+                    f"which is not in the training targets: {target_names}"
+                )
 
     def forward(
         self, batch: Dict[str, torch.Tensor]
@@ -254,6 +271,10 @@ class BaseModel(torch.nn.Module):
             last_layer_features[0] = layer(last_layer_features[0])  # only L=0
             last_layer_feature_dict[output_name] = last_layer_features
 
+        # Shared-feature targets reuse the source target's already-computed features
+        for target_name, source_name in self.shared_feature_source.items():
+            last_layer_feature_dict[target_name] = last_layer_feature_dict[source_name]
+
         for output_name, layer in self.last_layers.items():
             output: Dict[int, torch.Tensor] = {}
             for l_str, layer_L in layer.items():
@@ -267,33 +288,35 @@ class BaseModel(torch.nn.Module):
         return return_dict
 
     def _add_output(self, target_name, target_info):
-        if target_name not in self.head_types:
-            if target_info.is_scalar:
-                use_mlp = True  # default to MLP for scalars
+        # Shared targets reuse the source target's head outputs; skip head creation
+        if target_name not in self.shared_feature_source:
+            if target_name not in self.head_types:
+                if target_info.is_scalar:
+                    use_mlp = True  # default to MLP for scalars
+                else:
+                    use_mlp = False  # can't use MLP for equivariants
             else:
-                use_mlp = False  # can't use MLP for equivariants
-        else:
-            # specified by the user
-            use_mlp = self.head_types[target_name] == "mlp"
+                # specified by the user
+                use_mlp = self.head_types[target_name] == "mlp"
 
-        if use_mlp:
-            if target_info.is_spherical or target_info.is_cartesian:
-                # (in the future, one could consider enabling the MLP for the scalar
-                # part of equivariant targets, we keep it simple for now)
-                raise ValueError("MLP heads are only supported for scalar targets.")
+            if use_mlp:
+                if target_info.is_spherical or target_info.is_cartesian:
+                    # (in the future, one could consider enabling the MLP for the scalar
+                    # part of equivariant targets, we keep it simple for now)
+                    raise ValueError("MLP heads are only supported for scalar targets.")
 
-            w = self.mlp_head_expansion_ratio
-            layers = (
-                [Linear(self.k_max_l[0], self.k_max_l[0]), torch.nn.SiLU()]
-                if self.mlp_head_num_layers == 1
-                else [Linear(self.k_max_l[0], w * self.k_max_l[0]), torch.nn.SiLU()]
-                + [Linear(w * self.k_max_l[0], w * self.k_max_l[0]), torch.nn.SiLU()]
-                * (self.mlp_head_num_layers - 2)
-                + [Linear(w * self.k_max_l[0], self.k_max_l[0]), torch.nn.SiLU()]
-            )
-            self.heads[target_name] = torch.nn.Sequential(*layers)
-        else:
-            self.heads[target_name] = torch.nn.Identity()
+                w = self.mlp_head_expansion_ratio
+                layers = (
+                    [Linear(self.k_max_l[0], self.k_max_l[0]), torch.nn.SiLU()]
+                    if self.mlp_head_num_layers == 1
+                    else [Linear(self.k_max_l[0], w * self.k_max_l[0]), torch.nn.SiLU()]
+                    + [Linear(w * self.k_max_l[0], w * self.k_max_l[0]), torch.nn.SiLU()]
+                    * (self.mlp_head_num_layers - 2)
+                    + [Linear(w * self.k_max_l[0], self.k_max_l[0]), torch.nn.SiLU()]
+                )
+                self.heads[target_name] = torch.nn.Sequential(*layers)
+            else:
+                self.heads[target_name] = torch.nn.Identity()
 
         if target_info.is_scalar:
             self.last_layers[target_name] = torch.nn.ModuleDict(

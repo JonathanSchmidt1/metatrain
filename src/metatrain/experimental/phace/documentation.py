@@ -174,6 +174,17 @@ class ModelHypers(TypedDict):
     zbl: bool = False
     """Whether to use the ZBL potential in the model."""
 
+    shared_targets: dict[str, str] = {}
+    """Targets that reuse another target's head MLP outputs.
+
+    This is a dictionary mapping child target names to source target names.
+    For example, ``{"mace_features": "mtt::energy"}`` means that the
+    ``mace_features`` target will reuse the head MLP outputs of the
+    ``mtt::energy`` target, and only has its own final linear layer.
+    This is useful when you want multiple targets to share the same internal
+    representation.
+    """
+
 
 ##############################
 #  TRAINER HYPERPARAMETERS   #
