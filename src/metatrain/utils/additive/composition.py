@@ -267,8 +267,12 @@ class CompositionModel(torch.nn.Module):
         #             torch.distributed.all_reduce(XTX_block.values)
         #             torch.distributed.all_reduce(XTY_block.values)
 
-        # Fit the model on all ranks
-        self.model.fit(fixed_weights, targets_to_fit=self._new_outputs)
+        # Fit the model on all ranks. Since accumulation is disabled, default all
+        # unfixed targets to zero composition weights to avoid a singular linear system.
+        all_fixed_weights: dict = {name: 0.0 for name in self._new_outputs}
+        if fixed_weights:
+            all_fixed_weights.update(fixed_weights)
+        self.model.fit(all_fixed_weights, targets_to_fit=self._new_outputs)
 
         # update the buffer weights now they are fitted
         for target_name in self.model.weights.keys():

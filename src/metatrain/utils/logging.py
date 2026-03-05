@@ -336,7 +336,9 @@ def _get_digits(value: float) -> Tuple[int, int]:
         after the decimal point.
     """
 
-    # Get order of magnitude of the value:
+    # Get order of magnitude of the value (guard against 0 or negative):
+    if value <= 0:
+        return 10, 6
     order = int(np.floor(np.log10(value)))
 
     # Get the number of digits before the decimal point:
