@@ -436,7 +436,7 @@ def train_model(
     # which is extremely slow for large MemmapDatasets and also triggers a
     # TorchScript Labels class-registration crash in distributed (multi-rank) training.
     # Disabled; skipping dataset statistics.
-    # if sum(len(d) for d in train_datasets + val_datasets + test_datasets) < 1_000_000:
+    # if sum(len(d) for d in train_datasets + val_datasets + test_datasets) < 1_000:
     #     _print_stats("Training", train_datasets, dataset_info)
     #     _print_stats("Validation", val_datasets, dataset_info)
     #     _print_stats("Test", test_datasets, dataset_info)
