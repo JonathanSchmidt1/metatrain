@@ -616,13 +616,13 @@ class Trainer(TrainerInterface[TrainerHypers]):
                             scaled_tgts_v = (
                                 model.module if is_distributed else model
                             ).scaler(systems_v, targets_v)
-                        val_rmse_calculator.update(
-                            scaled_preds_v, scaled_tgts_v, extra_data_v
-                            )
-                        if self.hypers["log_mae"]:
-                            val_mae_calculator.update(
+                            val_rmse_calculator.update(
                                 scaled_preds_v, scaled_tgts_v, extra_data_v
                             )
+                            if self.hypers["log_mae"]:
+                                val_mae_calculator.update(
+                                    scaled_preds_v, scaled_tgts_v, extra_data_v
+                                )
                     sync_timing_cuda()
                     timing_sums["validation_total"] += time.perf_counter() - val_start
 
