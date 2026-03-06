@@ -437,3 +437,12 @@ def trainer_update_v11_v12(checkpoint: dict) -> None:
         else:
             optimizer = "Adam"
         checkpoint["train_hypers"]["optimizer"] = optimizer
+
+
+def trainer_update_v12_v13(checkpoint: dict) -> None:
+    """
+    Update trainer checkpoint from version 12 to version 13.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    checkpoint["train_hypers"]["max_atoms_per_batch"] = None
