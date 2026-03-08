@@ -48,7 +48,7 @@ from .modules.optimizer import get_optimizer, get_scheduler
 
 
 class Trainer(TrainerInterface[TrainerHypers]):
-    __checkpoint_version__ = 13
+    __checkpoint_version__ = 14
 
     def __init__(self, hypers: TrainerHypers) -> None:
         super().__init__(hypers)
@@ -56,6 +56,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
         self.optimizer_state_dict: Optional[Dict[str, Any]] = None
         self.scheduler_state_dict: Optional[Dict[str, Any]] = None
         self.epoch: Optional[int] = None
+        self.global_step: Optional[int] = None
         self.best_epoch: Optional[int] = None
         self.best_metric: Optional[float] = None
         self.best_model_state_dict: Optional[Dict[str, Any]] = None
@@ -242,8 +243,6 @@ class Trainer(TrainerInterface[TrainerHypers]):
         else:
             num_workers = self.hypers["num_workers"]
             validate_num_workers(num_workers)
-        pin_memory = device.type == "cuda"
-
         max_atoms = self.hypers.get("max_atoms_per_batch", None)
 
         # Samplers that need set_epoch() called each epoch (may be DistributedSampler
@@ -270,7 +269,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                         batch_sampler=batch_sampler,
                         collate_fn=collate_fn_train,
                         num_workers=num_workers,
-                        pin_memory=pin_memory,
+                        prefetch_factor=1 if num_workers > 0 else None,
                     )
                 )
             else:
@@ -292,7 +291,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                         drop_last=(train_sampler is None),
                         collate_fn=collate_fn_train,
                         num_workers=num_workers,
-                        pin_memory=pin_memory,
+                        prefetch_factor=1 if num_workers > 0 else None,
                     )
                 )
         train_dataloader = CombinedDataLoader(train_dataloaders, shuffle=True)
@@ -315,7 +314,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                         batch_sampler=val_batch_sampler,
                         collate_fn=collate_fn_val,
                         num_workers=num_workers,
-                        pin_memory=pin_memory,
+                        prefetch_factor=1 if num_workers > 0 else None,
                     )
                 )
             else:
@@ -328,7 +327,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                         drop_last=False,
                         collate_fn=collate_fn_val,
                         num_workers=num_workers,
-                        pin_memory=pin_memory,
+                        prefetch_factor=1 if num_workers > 0 else None,
                     )
                 )
         val_dataloader = CombinedDataLoader(val_dataloaders, shuffle=False)
@@ -391,7 +390,12 @@ class Trainer(TrainerInterface[TrainerHypers]):
         val_interval = self.hypers["validation_interval"]
         log_every_n_steps = max(1, round(log_interval * steps_per_epoch))
         val_every_n_steps = max(1, round(val_interval * steps_per_epoch))
-        global_step = start_epoch * steps_per_epoch
+        global_step = (
+            self.global_step
+            if self.global_step is not None
+            else start_epoch * steps_per_epoch
+        )
+        checkpoint_every_n_steps = self.hypers.get("checkpoint_every_n_steps", None)
         metric_logger = None
         profile_step_timing = bool(self.hypers.get("profile_step_timing", False))
         profile_step_timing_sync_cuda = bool(
@@ -750,6 +754,26 @@ class Trainer(TrainerInterface[TrainerHypers]):
                         )
                     train_loss = 0.0
 
+                # Step-level checkpointing
+                if (
+                    checkpoint_every_n_steps is not None
+                    and global_step % checkpoint_every_n_steps == 0
+                ):
+                    if is_distributed:
+                        torch.distributed.barrier()
+                    self.optimizer_state_dict = optimizer.state_dict()
+                    self.scheduler_state_dict = lr_scheduler.state_dict()
+                    self.epoch = epoch
+                    self.global_step = global_step
+                    if rank == 0:
+                        self.save_checkpoint(
+                            (model.module if is_distributed else model),
+                            Path(checkpoint_dir) / f"model_step_{global_step}.ckpt",
+                        )
+                        logging.info(
+                            f"Saved step checkpoint at global_step={global_step}"
+                        )
+
             if profile_step_timing and timed_steps > 0 and rank == 0:
                 loop_total = (
                     timing_sums["train_step_total"] + timing_sums["dataloader_wait"]
@@ -820,6 +844,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 "trainer_ckpt_version": self.__checkpoint_version__,
                 "train_hypers": self.hypers,
                 "epoch": self.epoch,
+                "global_step": self.global_step,
                 "optimizer_state_dict": self.optimizer_state_dict,
                 "scheduler_state_dict": self.scheduler_state_dict,
                 "best_epoch": self.best_epoch,
@@ -844,6 +869,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
         trainer.optimizer_state_dict = checkpoint["optimizer_state_dict"]
         trainer.scheduler_state_dict = checkpoint["scheduler_state_dict"]
         trainer.epoch = checkpoint["epoch"]
+        trainer.global_step = checkpoint.get("global_step", None)
         trainer.best_epoch = checkpoint["best_epoch"]
         trainer.best_metric = checkpoint["best_metric"]
         trainer.best_model_state_dict = checkpoint["best_model_state_dict"]

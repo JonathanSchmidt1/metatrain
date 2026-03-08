@@ -193,6 +193,11 @@ class TrainerHypers(TypedDict):
     interpreted as epoch counts."""
     checkpoint_interval: int = 100
     """Interval to save checkpoints."""
+    checkpoint_every_n_steps: Optional[int] = None
+    """If set, save a checkpoint every this many global training steps (in addition to
+    the epoch-level ``checkpoint_interval``). Useful with large datasets where a single
+    epoch can take many hours. Checkpoints are written as
+    ``model_step_{global_step}.ckpt``."""
     atomic_baseline: FixedCompositionWeights = {}
     """The baselines for each target.
 
