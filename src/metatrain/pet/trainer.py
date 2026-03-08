@@ -269,7 +269,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                         batch_sampler=batch_sampler,
                         collate_fn=collate_fn_train,
                         num_workers=num_workers,
-                        prefetch_factor=1 if num_workers > 0 else None,
+                        prefetch_factor=2 if num_workers > 0 else None,
                     )
                 )
             else:
@@ -291,7 +291,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                         drop_last=(train_sampler is None),
                         collate_fn=collate_fn_train,
                         num_workers=num_workers,
-                        prefetch_factor=1 if num_workers > 0 else None,
+                        prefetch_factor=2 if num_workers > 0 else None,
                     )
                 )
         train_dataloader = CombinedDataLoader(train_dataloaders, shuffle=True)
@@ -314,7 +314,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                         batch_sampler=val_batch_sampler,
                         collate_fn=collate_fn_val,
                         num_workers=num_workers,
-                        prefetch_factor=1 if num_workers > 0 else None,
+                        prefetch_factor=2 if num_workers > 0 else None,
                     )
                 )
             else:
@@ -327,7 +327,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                         drop_last=False,
                         collate_fn=collate_fn_val,
                         num_workers=num_workers,
-                        prefetch_factor=1 if num_workers > 0 else None,
+                        prefetch_factor=2 if num_workers > 0 else None,
                     )
                 )
         val_dataloader = CombinedDataLoader(val_dataloaders, shuffle=False)
