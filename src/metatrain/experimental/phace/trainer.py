@@ -192,23 +192,35 @@ class Trainer(TrainerInterface[TrainerHypers]):
             additive_model.to(dtype=torch.float64)
         model.scaler.to(dtype=torch.float64)
 
+        # Shared targets reuse another target's features and should not have a
+        # composition baseline or scaling fitted from data.
+        shared_target_names = set(model.model.shared_feature_source.keys())
+
+        composition_fixed_weights = dict(self.hypers["atomic_baseline"] or {})
+        for name in shared_target_names:
+            composition_fixed_weights[name] = 0.0
+
         logging.info("Calculating composition weights")
         model.additive_models[0].train_model(  # this is the composition model
             train_datasets,
             model.additive_models[1:],
             self.hypers["batch_size"],
             is_distributed,
-            self.hypers["atomic_baseline"],
+            composition_fixed_weights,
         )
 
         if self.hypers["scale_targets"]:
+            scaling_fixed_weights = dict(self.hypers["fixed_scaling_weights"] or {})
+            for name in shared_target_names:
+                scaling_fixed_weights[name] = 1.0
+
             logging.info("Calculating scaling weights")
             model.scaler.train_model(
                 train_datasets,
                 model.additive_models,
                 self.hypers["batch_size"],
                 is_distributed,
-                self.hypers["fixed_scaling_weights"],
+                scaling_fixed_weights,
             )
 
         if self.hypers["ema_decay"] is not None:
