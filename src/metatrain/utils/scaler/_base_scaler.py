@@ -484,28 +484,29 @@ class BaseScaler(torch.nn.Module):
         :param weights: Either a single float value to be applied to all atomic types,
             or a dict mapping atomic type (int) to weight (float).
         """
-        # Error out if multiple blocks or multiple properties are present. These are
-        # difficult to allow in the yaml files.
+        # Error out if multiple blocks are present. These are difficult to allow
+        # in the yaml files.
         if len(self.scales[target_name]) > 1:
             raise NotImplementedError(
                 "Multiple blocks are not supported for fixed weights in `Scaler` "
                 f"for target '{target_name}'"
             )
-        if len(self.scales[target_name].block().properties) > 1:
-            raise NotImplementedError(
-                f"Multiple properties are not supported for fixed weights in `Scaler` "
-                f"for target '{target_name}'"
-            )
 
         Y2_block = self.Y2[target_name].block()
         block = TensorBlock(
-            values=torch.empty_like(Y2_block.values),  # [1, 1] or [n_types, 1]
+            values=torch.empty_like(Y2_block.values),  # [n_types, n_props]
             samples=Y2_block.samples,
             components=Y2_block.components,
             properties=Y2_block.properties,
         )
 
         if isinstance(weights, dict):
+            # dict weights are per-atomic-type and target a single property column
+            if len(self.scales[target_name].block().properties) > 1:
+                raise NotImplementedError(
+                    "Multiple properties are not supported for dict-valued fixed "
+                    f"weights in `Scaler` for target '{target_name}'"
+                )
             for atomic_type in self.atomic_types.tolist():
                 # Error out if `weights` is a dict but the target is per-structure
                 if self.sample_kinds[target_name] == "per_structure":
