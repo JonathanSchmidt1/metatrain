@@ -201,6 +201,7 @@ class Scaler(torch.nn.Module):
         # Compute the scales on all ranks (with N=0, fit() sets all scales to 1.0)
         self.model.fit(fixed_weights=fixed_weights, targets_to_fit=self.new_outputs)
 
+        device = self.dummy_buffer.device
         # update the buffer scales now they are fitted
         for target_name in self.model.scales.keys():
             self.register_buffer(
