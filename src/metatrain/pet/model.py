@@ -144,6 +144,8 @@ class PET(ModelInterface[ModelHypers]):
 
         self.node_heads = torch.nn.ModuleDict()
         self.edge_heads = torch.nn.ModuleDict()
+        self.node_shared_projections = torch.nn.ModuleDict()
+        self.edge_shared_projections = torch.nn.ModuleDict()
         self.node_last_layers = torch.nn.ModuleDict()
         self.edge_last_layers = torch.nn.ModuleDict()
         self.last_layer_feature_size = (
@@ -930,14 +932,18 @@ class PET(ModelInterface[ModelHypers]):
                     edge_head(edge_features_list[i])
                 )
 
-        # Shared-feature targets reuse the source target's already-computed features
+        # Shared-feature targets apply a learned projection to the source's head outputs
         for target_name, source_name in self.shared_feature_source.items():
-            node_last_layer_features_dict[target_name] = (
-                node_last_layer_features_dict[source_name]
-            )
-            edge_last_layer_features_dict[target_name] = (
-                edge_last_layer_features_dict[source_name]
-            )
+            node_proj = self.node_shared_projections[target_name]
+            edge_proj = self.edge_shared_projections[target_name]
+            node_last_layer_features_dict[target_name] = [
+                node_proj[i](feat)
+                for i, feat in enumerate(node_last_layer_features_dict[source_name])
+            ]
+            edge_last_layer_features_dict[target_name] = [
+                edge_proj[i](feat)
+                for i, feat in enumerate(edge_last_layer_features_dict[source_name])
+            ]
 
         return node_last_layer_features_dict, edge_last_layer_features_dict
 
@@ -1349,6 +1355,27 @@ class PET(ModelInterface[ModelHypers]):
                     torch.nn.Sequential(
                         torch.nn.Linear(self.d_pet, self.d_head),
                         torch.nn.SiLU(),
+                        torch.nn.Linear(self.d_head, self.d_head),
+                        torch.nn.SiLU(),
+                    )
+                    for _ in range(self.num_readout_layers)
+                ]
+            )
+        else:
+            # Shared targets get a small projection (Linear + SiLU) applied to the
+            # source's head outputs before their own final linear layers.
+            self.node_shared_projections[target_name] = torch.nn.ModuleList(
+                [
+                    torch.nn.Sequential(
+                        torch.nn.Linear(self.d_head, self.d_head),
+                        torch.nn.SiLU(),
+                    )
+                    for _ in range(self.num_readout_layers)
+                ]
+            )
+            self.edge_shared_projections[target_name] = torch.nn.ModuleList(
+                [
+                    torch.nn.Sequential(
                         torch.nn.Linear(self.d_head, self.d_head),
                         torch.nn.SiLU(),
                     )

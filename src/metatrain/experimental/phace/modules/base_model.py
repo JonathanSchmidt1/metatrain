@@ -140,6 +140,7 @@ class BaseModel(torch.nn.Module):
             hypers.get("shared_targets", {})
         )
         self.heads = torch.nn.ModuleDict()
+        self.shared_projections = torch.nn.ModuleDict()
         self.last_layers = torch.nn.ModuleDict()
         target_names = list(dataset_info.targets.keys())
         for target_name, target_info in dataset_info.targets.items():
@@ -271,9 +272,12 @@ class BaseModel(torch.nn.Module):
             last_layer_features[0] = layer(last_layer_features[0])  # only L=0
             last_layer_feature_dict[output_name] = last_layer_features
 
-        # Shared-feature targets reuse the source target's already-computed features
+        # Shared-feature targets apply a learned projection to the source's head outputs
         for target_name, source_name in self.shared_feature_source.items():
-            last_layer_feature_dict[target_name] = last_layer_feature_dict[source_name]
+            source_features = last_layer_feature_dict[source_name]
+            proj_features = list(source_features)
+            proj_features[0] = self.shared_projections[target_name](source_features[0])
+            last_layer_feature_dict[target_name] = proj_features
 
         for output_name, layer in self.last_layers.items():
             output: Dict[int, torch.Tensor] = {}
@@ -288,7 +292,7 @@ class BaseModel(torch.nn.Module):
         return return_dict
 
     def _add_output(self, target_name, target_info):
-        # Shared targets reuse the source target's head outputs; skip head creation
+        # Shared targets: skip independent heads, use a learned projection instead
         if target_name not in self.shared_feature_source:
             if target_name not in self.head_types:
                 if target_info.is_scalar:
@@ -310,13 +314,23 @@ class BaseModel(torch.nn.Module):
                     [Linear(self.k_max_l[0], self.k_max_l[0]), torch.nn.SiLU()]
                     if self.mlp_head_num_layers == 1
                     else [Linear(self.k_max_l[0], w * self.k_max_l[0]), torch.nn.SiLU()]
-                    + [Linear(w * self.k_max_l[0], w * self.k_max_l[0]), torch.nn.SiLU()]
+                    + [
+                        Linear(w * self.k_max_l[0], w * self.k_max_l[0]),
+                        torch.nn.SiLU(),
+                    ]
                     * (self.mlp_head_num_layers - 2)
                     + [Linear(w * self.k_max_l[0], self.k_max_l[0]), torch.nn.SiLU()]
                 )
                 self.heads[target_name] = torch.nn.Sequential(*layers)
             else:
                 self.heads[target_name] = torch.nn.Identity()
+        else:
+            # Shared targets get a learned projection (Linear + SiLU) applied to the
+            # source's head outputs before their own final linear layers.
+            self.shared_projections[target_name] = torch.nn.Sequential(
+                Linear(self.k_max_l[0], self.k_max_l[0]),
+                torch.nn.SiLU(),
+            )
 
         if target_info.is_scalar:
             self.last_layers[target_name] = torch.nn.ModuleDict(
