@@ -68,15 +68,10 @@ class RMSEAccumulator:
                     self.information[key_to_write] = (0.0, 0)
 
                 if mask is None:
-                    if "non_conservative_stress" in key:
-                        # For stress targets, we allow users to use NaN entries for
-                        # systems without PBCs or with mixed PBCs. We filter them
-                        # out here.
-                        mask_as_tensor = ~torch.isnan(target_block.values)
-                    else:
-                        mask_as_tensor = torch.ones_like(
-                            target_block.values, dtype=torch.bool
-                        )
+                    # Filter NaN target values universally; this allows users to mark
+                    # missing entries (e.g. stress for non-PBC systems, or shared
+                    # targets absent for some structures) with NaN.
+                    mask_as_tensor = ~torch.isnan(target_block.values)
                     rmse_value = (
                         (
                             (
@@ -118,15 +113,7 @@ class RMSEAccumulator:
                     prediction_gradient = prediction_block.gradient(gradient_name)
 
                     if mask is None:
-                        if gradient_name == "strain":
-                            # For stress targets, we allow users to use NaN entries for
-                            # systems without PBCs or with mixed PBCs. We filter them
-                            # out here.
-                            mask_as_tensor = ~torch.isnan(target_gradient.values)
-                        else:
-                            mask_as_tensor = torch.ones_like(
-                                target_gradient.values, dtype=torch.bool
-                            )
+                        mask_as_tensor = ~torch.isnan(target_gradient.values)
                         gradient_rmse_value = (
                             (
                                 (
@@ -267,15 +254,10 @@ class MAEAccumulator:
                     self.information[key_to_write] = (0.0, 0)
 
                 if mask is None:
-                    if "non_conservative_stress" in key:
-                        # For stress targets, we allow users to use NaN entries for
-                        # systems without PBCs or with mixed PBCs. We filter them
-                        # out here.
-                        mask_as_tensor = ~torch.isnan(target_block.values)
-                    else:
-                        mask_as_tensor = torch.ones_like(
-                            target_block.values, dtype=torch.bool
-                        )
+                    # Filter NaN target values universally; this allows users to mark
+                    # missing entries (e.g. stress for non-PBC systems, or shared
+                    # targets absent for some structures) with NaN.
+                    mask_as_tensor = ~torch.isnan(target_block.values)
                     mae_value = (
                         (
                             prediction_block.values[mask_as_tensor]
@@ -313,15 +295,7 @@ class MAEAccumulator:
                     prediction_gradient = prediction_block.gradient(gradient_name)
 
                     if mask is None:
-                        if gradient_name == "strain":
-                            # For stress targets, we allow users to use NaN entries for
-                            # systems without PBCs or with mixed PBCs. We filter them
-                            # out here.
-                            mask_as_tensor = ~torch.isnan(target_gradient.values)
-                        else:
-                            mask_as_tensor = torch.ones_like(
-                                target_gradient.values, dtype=torch.bool
-                            )
+                        mask_as_tensor = ~torch.isnan(target_gradient.values)
                         gradient_mae_value = (
                             (
                                 prediction_gradient.values[mask_as_tensor]
