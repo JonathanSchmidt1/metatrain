@@ -177,10 +177,18 @@ class TrainerHypers(TypedDict):
     """Learning rate."""
     weight_decay: Optional[float] = None
 
-    log_interval: int = 1
-    """Interval to log metrics."""
+    log_interval: float = 1.0
+    """Interval (in epochs) to log metrics. Can be fractional, e.g. ``0.1`` to log
+    every 10% of an epoch."""
+    validation_interval: float = 1.0
+    """Interval (in epochs) to run validation. Can be fractional, e.g. ``0.5`` to
+    validate twice per epoch."""
     checkpoint_interval: int = 100
-    """Interval to save checkpoints."""
+    """Interval (in epochs) to save checkpoints."""
+    checkpoint_every_n_steps: Optional[int] = None
+    """Save a step-level checkpoint every N gradient steps. If set, saves
+    ``model_step_{N}.ckpt`` files in the checkpoint directory. If ``None``
+    (default), only epoch-level checkpoints are saved."""
     atomic_baseline: FixedCompositionWeights = {}
     """The baselines for each target.
 
