@@ -232,11 +232,15 @@ class TrainerHypers(TypedDict):
     """Decay factor for exponential moving average of model parameters.
     If None, EMA is not used."""
 
-    log_interval: int = 1
-    """Interval to log metrics during training."""
-
-    checkpoint_interval: int = 25
-    """Interval to save model checkpoints."""
+    log_interval: float = 1.0
+    """Interval (in epochs) to log metrics. Can be fractional, e.g. ``0.1`` to log
+    every 10% of an epoch."""
+    validation_interval: float = 1.0
+    """Interval (in epochs) to run validation. Can be fractional, e.g. ``0.5`` to
+    validate twice per epoch."""
+    checkpoint_interval: float = 1.0
+    """Interval (in epochs) to save checkpoints. Can be fractional, e.g. ``0.5`` to
+    save a checkpoint every half-epoch."""
 
     scale_targets: bool = True
     """Whether to scale targets during training."""

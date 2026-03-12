@@ -107,10 +107,10 @@ class TrainerHypers(TypedDict):
 
     weight_decay: Optional[float] = None
 
-    log_interval: int = 1
+    log_interval: float = 1
     """Interval to log metrics."""
 
-    checkpoint_interval: int = 100
+    checkpoint_interval: float = 100
     """Interval to save checkpoints."""
 
     per_structure_targets: list[str] = []

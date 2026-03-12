@@ -597,6 +597,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                         epoch=epoch,
                         rank=rank,
                         learning_rate=optimizer.param_groups[0]["lr"],
+                        step=global_step,
                     )
 
                     val_metric = get_selected_metric(

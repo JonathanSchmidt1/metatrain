@@ -151,9 +151,9 @@ class TrainerHypers(TypedDict):
     """Fraction of training steps used for learning rate warmup."""
     learning_rate: float = 1e-3
     """Learning rate."""
-    log_interval: int = 5
+    log_interval: float = 5
     """Interval to log metrics."""
-    checkpoint_interval: int = 25
+    checkpoint_interval: float = 25
     """Interval to save checkpoints."""
     atomic_baseline: FixedCompositionWeights = {}
     """The baselines for each target.

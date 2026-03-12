@@ -323,9 +323,9 @@ class TrainerHypers(TypedDict):
     num_epochs: int = 1000
     """Number of epochs."""
 
-    log_interval: int = 1
+    log_interval: float = 1
     """Interval to log metrics."""
-    checkpoint_interval: int = 100
+    checkpoint_interval: float = 100
     """Interval to save checkpoints."""
     scale_targets: bool = True
     """Normalize targets to unit std during training."""

@@ -486,7 +486,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                     initial_metrics=[finalized_train_info, finalized_val_info],
                     names=["training", "validation"],
                 )
-            if epoch % self.hypers["log_interval"] == 0:
+            if epoch % round(self.hypers["log_interval"]) == 0:
                 metric_logger.log(
                     metrics=[finalized_train_info, finalized_val_info],
                     epoch=epoch,
@@ -505,7 +505,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 self.best_epoch = epoch
                 self.best_optimizer_state_dict = copy.deepcopy(optimizer.state_dict())
 
-            if epoch % self.hypers["checkpoint_interval"] == 0:
+            if epoch % round(self.hypers["checkpoint_interval"]) == 0:
                 if is_distributed:
                     torch.distributed.barrier()
                 self.optimizer_state_dict = optimizer.state_dict()

@@ -179,9 +179,9 @@ class TrainerHypers(TypedDict):
     """Learning rate."""
     weight_decay: Optional[float] = None
 
-    log_interval: int = 1
+    log_interval: float = 1
     """Interval to log metrics."""
-    checkpoint_interval: int = 100
+    checkpoint_interval: float = 100
     """Interval to save checkpoints."""
     atomic_baseline: FixedCompositionWeights = {}
     """The baselines for each target.

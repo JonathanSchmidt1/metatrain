@@ -63,7 +63,7 @@ class TrainerHypers(TypedDict):
     """Path to the pre-trained model checkpoint.
     This checkpoint's backbone will be frozen and used for feature extraction.
     """
-    log_interval: int = 1
+    log_interval: float = 1
     """Interval for logging training progress (in epochs)."""
-    checkpoint_interval: int = 100
+    checkpoint_interval: float = 100
     """Interval for saving checkpoints during training (in epochs)."""

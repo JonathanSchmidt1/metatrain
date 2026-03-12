@@ -113,12 +113,21 @@ class WandbHandler(logging.Handler):
         """
         pass
 
-    def emit_data(self, keys: List[str], values: List[str], units: List[str]) -> None:
+    def emit_data(
+        self,
+        keys: List[str],
+        values: List[str],
+        units: List[str],
+        step: Optional[int] = None,
+    ) -> None:
         """Log structured data to Weights & Biases.
 
         :param keys: Column header names
         :param values: Data values to write
         :param units: Units for each column
+        :param step: Optional wandb step override. If provided, used instead of the
+            ``Epoch`` field so that step-level and epoch-level metrics share the same
+            x-axis.
         """
         _validate_length(keys, values, units)
 
@@ -132,7 +141,8 @@ class WandbHandler(logging.Handler):
             data[name] = float(value)
 
         epoch = int(data.pop("Epoch"))
-        self.run.log(data, step=epoch, commit=True)
+        wandb_step = step if step is not None else epoch
+        self.run.log(data, step=wandb_step, commit=True)
 
     def close(self) -> None:
         super().close()
@@ -142,16 +152,23 @@ class WandbHandler(logging.Handler):
 class CustomLogger(logging.Logger):
     """Custom logger to log structured data."""
 
-    def data(self, keys: List[str], values: List[str], units: List[str]) -> None:
+    def data(
+        self,
+        keys: List[str],
+        values: List[str],
+        units: List[str],
+        step: Optional[int] = None,
+    ) -> None:
         """Logs data entries to handlers that support an ``emit_data`` method.
 
         :param keys: Column header names
         :param values: Data values to write
         :param units: Units for each column
+        :param step: Optional step override passed through to handlers.
         """
         for handler in self.handlers:
             if hasattr(handler, "emit_data"):
-                handler.emit_data(keys, values, units)
+                handler.emit_data(keys, values, units, step=step)
 
 
 # Use `CustomLogger` as default class. The line below will NOT (!) change the `root`
@@ -235,6 +252,7 @@ class MetricLogger:
         epoch: Optional[int] = None,
         rank: Optional[int] = None,
         learning_rate: Optional[float] = None,
+        step: Optional[int] = None,
     ) -> None:
         """
         Log the metrics.
@@ -249,6 +267,9 @@ class MetricLogger:
         :param rank: The rank of the process, if the training is distributed. In that
             case, the logger will only print the metrics for the process with rank 0.
         :param learning_rate: The current learning rate (optional).
+        :param step: Optional wandb step override. When provided, wandb uses this value
+            as the x-axis step instead of ``epoch``, keeping step-level and
+            epoch-level metrics on the same axis.
         """
         if rank and rank != 0:
             return
@@ -304,7 +325,7 @@ class MetricLogger:
                     units.append("")
 
         if is_training and isinstance(self.log_obj, CustomLogger):
-            self.log_obj.data(keys, values, units)
+            self.log_obj.data(keys, values, units, step=step)
 
         # add space between value and unit only if the unit is not empty. Avoiding
         # double space when joining metric below

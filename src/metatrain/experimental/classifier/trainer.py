@@ -307,7 +307,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 )
 
             # Log progress
-            if epoch % self.hypers["log_interval"] == 0:
+            if epoch % round(self.hypers["log_interval"]) == 0:
                 metric_logger.log(
                     metrics=[finalized_train_info, finalized_val_info],
                     epoch=epoch,
@@ -315,7 +315,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 )
 
             # Save checkpoint
-            if epoch % self.hypers["checkpoint_interval"] == 0:
+            if epoch % round(self.hypers["checkpoint_interval"]) == 0:
                 checkpoint_path = Path(checkpoint_dir) / f"checkpoint_{epoch}.ckpt"
                 self.save_checkpoint(model, checkpoint_path)
 
