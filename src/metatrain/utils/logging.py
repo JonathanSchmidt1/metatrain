@@ -64,7 +64,13 @@ class CSVFileHandler(logging.FileHandler):
         """
         pass
 
-    def emit_data(self, keys: List[str], values: List[str], units: List[str]) -> None:
+    def emit_data(
+        self,
+        keys: List[str],
+        values: List[str],
+        units: List[str],
+        step: Optional[int] = None,
+    ) -> None:
         """Write structured data to the CSV file.
 
         ``keys`` and ``values`` are written only the first time this methods is called.
@@ -72,6 +78,8 @@ class CSVFileHandler(logging.FileHandler):
         :param keys: Column header names
         :param values: Data values to write
         :param units: Units for each column
+        :param step: Unused; accepted for interface compatibility with
+            :class:`WandbHandler`.
         """
         _validate_length(keys, values, units)
 
