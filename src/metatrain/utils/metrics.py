@@ -68,10 +68,10 @@ class RMSEAccumulator:
                     self.information[key_to_write] = (0.0, 0)
 
                 if mask is None:
-                    # Filter NaN target values universally; this allows users to mark
-                    # missing entries (e.g. stress for non-PBC systems, or shared
-                    # targets absent for some structures) with NaN.
-                    mask_as_tensor = ~torch.isnan(target_block.values)
+                    # Filter non-finite target values universally; this allows users to
+                    # mark missing entries (e.g. stress for non-PBC systems, or shared
+                    # targets absent for some structures) with NaN or inf.
+                    mask_as_tensor = torch.isfinite(target_block.values)
                     rmse_value = (
                         (
                             (
@@ -113,7 +113,7 @@ class RMSEAccumulator:
                     prediction_gradient = prediction_block.gradient(gradient_name)
 
                     if mask is None:
-                        mask_as_tensor = ~torch.isnan(target_gradient.values)
+                        mask_as_tensor = torch.isfinite(target_gradient.values)
                         gradient_rmse_value = (
                             (
                                 (
@@ -254,10 +254,10 @@ class MAEAccumulator:
                     self.information[key_to_write] = (0.0, 0)
 
                 if mask is None:
-                    # Filter NaN target values universally; this allows users to mark
-                    # missing entries (e.g. stress for non-PBC systems, or shared
-                    # targets absent for some structures) with NaN.
-                    mask_as_tensor = ~torch.isnan(target_block.values)
+                    # Filter non-finite target values universally; this allows users to
+                    # mark missing entries (e.g. stress for non-PBC systems, or shared
+                    # targets absent for some structures) with NaN or inf.
+                    mask_as_tensor = torch.isfinite(target_block.values)
                     mae_value = (
                         (
                             prediction_block.values[mask_as_tensor]
@@ -295,7 +295,7 @@ class MAEAccumulator:
                     prediction_gradient = prediction_block.gradient(gradient_name)
 
                     if mask is None:
-                        mask_as_tensor = ~torch.isnan(target_gradient.values)
+                        mask_as_tensor = torch.isfinite(target_gradient.values)
                         gradient_mae_value = (
                             (
                                 prediction_gradient.values[mask_as_tensor]

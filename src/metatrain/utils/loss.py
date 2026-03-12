@@ -199,10 +199,10 @@ class BaseTensorMapLoss(LossInterface):
         all_predictions_flattened = torch.cat(list_of_prediction_segments)
         all_targets_flattened = torch.cat(list_of_target_segments)
 
-        # Filter out NaN target values. This allows users to mark entries as missing
-        # (e.g. stress for non-PBC systems, or shared targets absent for some
-        # structures).
-        valid_mask = ~torch.isnan(all_targets_flattened)
+        # Filter out non-finite (NaN or inf) target values. This allows users to
+        # mark missing entries by writing NaN, and also guards against inf values
+        # from data normalization issues or improper missing-value markers.
+        valid_mask = torch.isfinite(all_targets_flattened)
         all_predictions_flattened = all_predictions_flattened[valid_mask]
         all_targets_flattened = all_targets_flattened[valid_mask]
 

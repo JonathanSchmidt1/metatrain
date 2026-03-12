@@ -943,6 +943,24 @@ def _properties_name(output_name: str) -> str:
     return base
 
 
+def _infer_float_dtype(path: Union[str, "Path"], shape: Tuple) -> str:
+    """Infer whether a binary file contains float32 or float64 values from its size."""
+    file_size = os.path.getsize(path)
+    n_elements = 1
+    for s in shape:
+        n_elements *= s
+    if file_size == n_elements * 4:
+        return "float32"
+    elif file_size == n_elements * 8:
+        return "float64"
+    else:
+        raise ValueError(
+            f"Cannot determine dtype for {path}: file size {file_size} bytes is "
+            f"inconsistent with shape {shape} (expected {n_elements * 4} for float32 "
+            f"or {n_elements * 8} for float64)."
+        )
+
+
 class MemmapArray:
     """
     Small helper to reopen a ``np.memmap`` lazily in each worker.
@@ -1041,10 +1059,11 @@ class MemmapDataset(TorchDataset):
             )
             number_of_properties = single_target_options["num_subtargets"]
             if single_target_options["type"] == "scalar":
+                shape = (number_of_samples, number_of_properties)
                 self.target_arrays[target_key] = MemmapArray(
                     path / f"{data_key}.bin",
-                    (number_of_samples, number_of_properties),
-                    "float32",
+                    shape,
+                    _infer_float_dtype(path / f"{data_key}.bin", shape),
                     mode="r",
                 )
                 if (
@@ -1054,17 +1073,25 @@ class MemmapDataset(TorchDataset):
                 ):
                     # energy target: look into potential gradients
                     if single_target_options["forces"]:
+                        shape = (self.na[-1], 3, 1)
                         self.target_arrays[f"{target_key}_forces"] = MemmapArray(
                             path / f"{single_target_options['forces']['key']}.bin",
-                            (self.na[-1], 3, 1),
-                            "float32",
+                            shape,
+                            _infer_float_dtype(
+                                path / f"{single_target_options['forces']['key']}.bin",
+                                shape,
+                            ),
                             mode="r",
                         )
                     if single_target_options["stress"]:
+                        shape = (self.ns, 3, 3, 1)
                         self.target_arrays[f"{target_key}_stress"] = MemmapArray(
                             path / f"{single_target_options['stress']['key']}.bin",
-                            (self.ns, 3, 3, 1),
-                            "float32",
+                            shape,
+                            _infer_float_dtype(
+                                path / f"{single_target_options['stress']['key']}.bin",
+                                shape,
+                            ),
                             mode="r",
                         )
                     if single_target_options["virial"]:
@@ -1086,7 +1113,10 @@ class MemmapDataset(TorchDataset):
                         + (number_of_properties,)
                     )
                     self.target_arrays[target_key] = MemmapArray(
-                        path / f"{data_key}.bin", shape, "float32", mode="r"
+                        path / f"{data_key}.bin",
+                        shape,
+                        _infer_float_dtype(path / f"{data_key}.bin", shape),
+                        mode="r",
                     )
             else:
                 raise ValueError(
