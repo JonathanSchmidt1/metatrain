@@ -434,3 +434,17 @@ def trainer_update_v12_v13(checkpoint: dict) -> None:
     )
     checkpoint["train_hypers"].setdefault("validation_interval", 1.0)
     checkpoint["train_hypers"].setdefault("checkpoint_every_n_steps", None)
+
+
+def trainer_update_v13_v14(checkpoint: dict) -> None:
+    """
+    Update trainer checkpoint from version 13 to version 14.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    # Convert integer checkpoint_interval to float (fraction of epoch) and
+    # remove checkpoint_every_n_steps (now subsumed by checkpoint_interval)
+    checkpoint["train_hypers"]["checkpoint_interval"] = float(
+        checkpoint["train_hypers"].get("checkpoint_interval", 100)
+    )
+    checkpoint["train_hypers"].pop("checkpoint_every_n_steps", None)

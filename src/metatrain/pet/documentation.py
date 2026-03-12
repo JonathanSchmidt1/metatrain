@@ -183,12 +183,9 @@ class TrainerHypers(TypedDict):
     validation_interval: float = 1.0
     """Interval (in epochs) to run validation. Can be fractional, e.g. ``0.5`` to
     validate twice per epoch."""
-    checkpoint_interval: int = 100
-    """Interval (in epochs) to save checkpoints."""
-    checkpoint_every_n_steps: Optional[int] = None
-    """Save a step-level checkpoint every N gradient steps. If set, saves
-    ``model_step_{N}.ckpt`` files in the checkpoint directory. If ``None``
-    (default), only epoch-level checkpoints are saved."""
+    checkpoint_interval: float = 1.0
+    """Interval (in epochs) to save checkpoints. Can be fractional, e.g. ``0.5`` to
+    save a checkpoint every half-epoch."""
     atomic_baseline: FixedCompositionWeights = {}
     """The baselines for each target.
 

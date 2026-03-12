@@ -77,7 +77,7 @@ def get_scheduler(
 
 
 class Trainer(TrainerInterface[TrainerHypers]):
-    __checkpoint_version__ = 13
+    __checkpoint_version__ = 14
 
     def __init__(self, hypers: TrainerHypers) -> None:
         super().__init__(hypers)
@@ -365,9 +365,9 @@ class Trainer(TrainerInterface[TrainerHypers]):
             1, round(self.hypers["validation_interval"] * steps_per_epoch)
         )
         log_every_n_steps = max(1, round(self.hypers["log_interval"] * steps_per_epoch))
-        checkpoint_every_n_steps: Optional[int] = self.hypers[
-            "checkpoint_every_n_steps"
-        ]
+        checkpoint_every_n_steps = max(
+            1, round(self.hypers["checkpoint_interval"] * steps_per_epoch)
+        )
         global_step = start_epoch * steps_per_epoch
 
         # Find wandb handler for step-level loss logging
@@ -465,10 +465,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                     )
 
                 # Step-level checkpoint
-                if (
-                    checkpoint_every_n_steps is not None
-                    and global_step % checkpoint_every_n_steps == 0
-                ):
+                if global_step % checkpoint_every_n_steps == 0:
                     if is_distributed:
                         torch.distributed.barrier()
                     self.optimizer_state_dict = optimizer.state_dict()
@@ -624,18 +621,6 @@ class Trainer(TrainerInterface[TrainerHypers]):
                             self.hypers["log_separate_blocks"]
                         )
                     train_loss = 0.0
-
-            if epoch % self.hypers["checkpoint_interval"] == 0:
-                if is_distributed:
-                    torch.distributed.barrier()
-                self.optimizer_state_dict = optimizer.state_dict()
-                self.scheduler_state_dict = lr_scheduler.state_dict()
-                self.epoch = epoch
-                if rank == 0:
-                    self.save_checkpoint(
-                        (model.module if is_distributed else model),
-                        Path(checkpoint_dir) / f"model_{epoch}.ckpt",
-                    )
 
         # prepare for the checkpoint that will be saved outside the function
         self.epoch = epoch
