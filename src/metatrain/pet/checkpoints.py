@@ -429,3 +429,11 @@ def trainer_update_v12_v13(checkpoint: dict) -> None:
     :param checkpoint: The checkpoint to update.
     """
     checkpoint["train_hypers"]["compile"] = False
+    # Convert log_interval to float (was int) and add new QoL hypers
+    checkpoint["train_hypers"]["log_interval"] = float(
+        checkpoint["train_hypers"].get("log_interval", 1)
+    )
+    checkpoint["train_hypers"].setdefault("validation_interval", 1.0)
+    checkpoint["train_hypers"].setdefault("checkpoint_every_n_steps", None)
+    checkpoint["train_hypers"].setdefault("profile_step_timing", False)
+    checkpoint["train_hypers"].setdefault("profile_step_timing_sync_cuda", False)

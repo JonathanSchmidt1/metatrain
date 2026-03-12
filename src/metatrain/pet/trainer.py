@@ -542,6 +542,9 @@ class Trainer(TrainerInterface[TrainerHypers]):
         log_every_n_steps = max(1, round(log_interval * steps_per_epoch))
         val_every_n_steps = max(1, round(val_interval * steps_per_epoch))
         global_step = start_epoch * steps_per_epoch
+        checkpoint_every_n_steps: Optional[int] = self.hypers.get(
+            "checkpoint_every_n_steps"
+        )
         metric_logger = None
         profile_step_timing = bool(self.hypers.get("profile_step_timing", False))
         profile_step_timing_sync_cuda = bool(
@@ -729,17 +732,21 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 for key in scaled_predictions:
                     pred = scaled_predictions[key].block().values
                     tgt = scaled_targets[key].block().values
-                    postfix[key] = (
-                        f"{torch.sqrt(torch.mean((pred - tgt) ** 2)).item():.4e}"
-                    )
+                    valid = ~torch.isnan(tgt)
+                    if valid.any():
+                        err = pred[valid] - tgt[valid]
+                        postfix[key] = f"{torch.sqrt(torch.mean(err**2)).item():.4e}"
                     if scaled_predictions[key].block().has_gradient("positions"):
                         pg = (
                             scaled_predictions[key].block().gradient("positions").values
                         )
                         tg = scaled_targets[key].block().gradient("positions").values
-                        postfix["forces"] = (
-                            f"{torch.sqrt(torch.mean((pg - tg) ** 2)).item():.4e}"
-                        )
+                        valid_g = ~torch.isnan(tg)
+                        if valid_g.any():
+                            gerr = pg[valid_g] - tg[valid_g]
+                            postfix["forces"] = (
+                                f"{torch.sqrt(torch.mean(gerr**2)).item():.4e}"
+                            )
                 pbar.set_postfix(postfix)
                 sync_timing_cuda()
                 timing_sums["metrics_logging"] += time.perf_counter() - t0
@@ -749,6 +756,22 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 sync_timing_cuda()
                 timing_sums["train_step_total"] += time.perf_counter() - step_start
                 last_step_end = time.perf_counter()
+
+                # Step-level checkpoint
+                if (
+                    checkpoint_every_n_steps is not None
+                    and global_step % checkpoint_every_n_steps == 0
+                ):
+                    if is_distributed:
+                        torch.distributed.barrier()
+                    self.optimizer_state_dict = optimizer.state_dict()
+                    self.scheduler_state_dict = lr_scheduler.state_dict()
+                    self.epoch = epoch
+                    if rank == 0:
+                        self.save_checkpoint(
+                            (model.module if is_distributed else model),
+                            Path(checkpoint_dir) / f"model_step_{global_step}.ckpt",
+                        )
 
                 # Step-level wandb logging (between validation points)
                 if (
@@ -811,9 +834,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                         for val_batch in val_dataloader:
                             if should_skip_batch(val_batch, is_distributed, device):
                                 continue
-                            systems_v, targets_v, extra_data_v = unpack_batch(
-                                val_batch
-                            )
+                            systems_v, targets_v, extra_data_v = unpack_batch(val_batch)
                             systems_v, targets_v, extra_data_v = batch_to(
                                 systems_v,
                                 targets_v,
