@@ -1732,3 +1732,112 @@ def test_regression_validation_batch_size_constraint_removed():
                     )
         else:
             raise ValueError(f"Trainer file {trainer_file} does not exist.")
+
+
+# ============================================================
+# Tests for indices_file validation_set / test_set splitting
+# ============================================================
+
+
+def _read_saved_indices(pattern: str) -> list[int]:
+    """Read a saved indices text file and return a sorted list of ints."""
+    paths = glob.glob(pattern)
+    assert len(paths) == 1, f"Expected 1 file matching {pattern!r}, got {paths}"
+    return sorted(np.loadtxt(paths[0], dtype=int).tolist())
+
+
+@pytest.mark.parametrize("use_npy", [False, True])
+def test_indices_file_validation_set(monkeypatch, tmp_path, options, use_npy):
+    """Validation split via indices_file: train ∪ val = full dataset, disjoint."""
+    monkeypatch.chdir(tmp_path)
+    shutil.copy(DATASET_PATH_QM9, "qm9_reduced_100.xyz")
+
+    val_indices = list(range(10, 30))  # 20 samples as validation
+
+    if use_npy:
+        indices_path = "val_indices.npy"
+        np.save(indices_path, np.array(val_indices))
+    else:
+        indices_path = "val_indices.txt"
+        np.savetxt(indices_path, val_indices, fmt="%d")
+
+    options["validation_set"] = OmegaConf.create({"indices_file": indices_path})
+    options["test_set"] = 0.0  # no test split
+
+    train_model(options)
+
+    train_idx = _read_saved_indices("outputs/*/*/indices/training.txt")
+    val_idx = _read_saved_indices("outputs/*/*/indices/validation.txt")
+
+    assert set(train_idx) & set(val_idx) == set(), "train and val overlap"
+    assert sorted(set(train_idx) | set(val_idx)) == list(range(100))
+    assert val_idx == sorted(val_indices)
+
+
+@pytest.mark.parametrize("use_npy", [False, True])
+def test_indices_file_test_set(monkeypatch, tmp_path, options, use_npy):
+    """Test split via indices_file: train ∪ test = full dataset, disjoint."""
+    monkeypatch.chdir(tmp_path)
+    shutil.copy(DATASET_PATH_QM9, "qm9_reduced_100.xyz")
+
+    test_indices = list(range(80, 100))  # last 20 samples as test
+
+    if use_npy:
+        indices_path = "test_indices.npy"
+        np.save(indices_path, np.array(test_indices))
+    else:
+        indices_path = "test_indices.txt"
+        np.savetxt(indices_path, test_indices, fmt="%d")
+
+    options["validation_set"] = 0.0  # no validation split
+    options["test_set"] = OmegaConf.create({"indices_file": indices_path})
+
+    train_model(options)
+
+    train_idx = _read_saved_indices("outputs/*/*/indices/training.txt")
+    test_idx = _read_saved_indices("outputs/*/*/indices/test.txt")
+
+    assert set(train_idx) & set(test_idx) == set(), "train and test overlap"
+    assert sorted(set(train_idx) | set(test_idx)) == list(range(100))
+    assert test_idx == sorted(test_indices)
+
+
+def test_indices_file_val_and_test(monkeypatch, tmp_path, options):
+    """Val + test both via indices_file: all three sets disjoint and cover the dataset."""
+    monkeypatch.chdir(tmp_path)
+    shutil.copy(DATASET_PATH_QM9, "qm9_reduced_100.xyz")
+
+    val_indices = list(range(0, 15))   # first 15 as val
+    test_indices = list(range(85, 100))  # last 15 as test
+
+    np.savetxt("val_indices.txt", val_indices, fmt="%d")
+    np.savetxt("test_indices.txt", test_indices, fmt="%d")
+
+    options["validation_set"] = OmegaConf.create({"indices_file": "val_indices.txt"})
+    options["test_set"] = OmegaConf.create({"indices_file": "test_indices.txt"})
+
+    train_model(options)
+
+    train_idx = _read_saved_indices("outputs/*/*/indices/training.txt")
+    val_idx = _read_saved_indices("outputs/*/*/indices/validation.txt")
+    test_idx = _read_saved_indices("outputs/*/*/indices/test.txt")
+
+    assert set(train_idx) & set(val_idx) == set(), "train and val overlap"
+    assert set(train_idx) & set(test_idx) == set(), "train and test overlap"
+    assert set(val_idx) & set(test_idx) == set(), "val and test overlap"
+    assert sorted(set(train_idx) | set(val_idx) | set(test_idx)) == list(range(100))
+    assert val_idx == sorted(val_indices)
+    assert test_idx == sorted(test_indices)
+
+
+def test_indices_file_multiple_datasets_raises(monkeypatch, tmp_path, options):
+    """indices_file is only supported with a single training dataset."""
+    monkeypatch.chdir(tmp_path)
+    shutil.copy(DATASET_PATH_QM9, "qm9_reduced_100.xyz")
+    np.savetxt("val_indices.txt", [0, 1, 2], fmt="%d")
+
+    options["training_set"] = OmegaConf.create(2 * [options["training_set"]])
+    options["validation_set"] = OmegaConf.create({"indices_file": "val_indices.txt"})
+
+    with pytest.raises(ValueError, match="indices_file validation_set is only supported"):
+        train_model(options)

@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 from metatensor.torch import Labels, TensorBlock, TensorMap
@@ -19,6 +20,7 @@ from metatrain.utils.data import (
     read_targets,
     unpack_batch,
 )
+from metatrain.utils.data.dataset import _load_indices_from_file
 
 
 RESOURCES_PATH = Path(__file__).parents[2] / "resources"
@@ -711,5 +713,41 @@ def test_instance_torchscript_compatible(layout_scalar):
             )
         },
     )
-
     torch.jit.script(dataset_info)
+
+
+# ============================================================
+# Tests for _load_indices_from_file
+# ============================================================
+
+
+def test_load_indices_from_txt_file(tmp_path):
+    indices = [3, 7, 15, 42]
+    txt_file = tmp_path / "indices.txt"
+    np.savetxt(txt_file, indices, fmt="%d")
+
+    result = _load_indices_from_file(txt_file)
+
+    assert result == indices
+    assert all(isinstance(i, int) for i in result)
+
+
+def test_load_indices_from_npy_file(tmp_path):
+    indices = [0, 5, 10, 99]
+    npy_file = tmp_path / "indices.npy"
+    np.save(npy_file, np.array(indices))
+
+    result = _load_indices_from_file(npy_file)
+
+    assert result == indices
+    assert all(isinstance(i, int) for i in result)
+
+
+def test_load_indices_accepts_string_path(tmp_path):
+    indices = [1, 2, 3]
+    txt_file = tmp_path / "indices.txt"
+    np.savetxt(txt_file, indices, fmt="%d")
+
+    result = _load_indices_from_file(str(txt_file))
+
+    assert result == indices
