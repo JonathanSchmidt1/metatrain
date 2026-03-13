@@ -55,6 +55,9 @@ class PET(ModelInterface[ModelHypers]):
         references={"architecture": ["https://arxiv.org/abs/2305.19302v3"]}
     )
     component_labels: Dict[str, List[List[Labels]]]
+    target_names: List[str]
+    last_layer_parameter_names: Dict[str, List[str]]
+    shared_feature_source: Dict[str, str]
     NUM_FEATURE_TYPES: int = 2  # node + edge features
 
     def __init__(self, hypers: ModelHypers, dataset_info: DatasetInfo) -> None:
@@ -932,14 +935,17 @@ class PET(ModelInterface[ModelHypers]):
                     edge_head(edge_features_list[i])
                 )
 
-        # Shared-feature targets apply a learned projection to the source's head outputs
-        for target_name, source_name in self.shared_feature_source.items():
-            node_proj = self.node_shared_projections[target_name]
-            edge_proj = self.edge_shared_projections[target_name]
+        # Shared-feature targets apply a learned projection to the source's head outputs.
+        # Iterate over ModuleDicts via .items() to avoid dynamic string indexing
+        # (TorchScript only supports string-literal ModuleDict keys).
+        for target_name, node_proj in self.node_shared_projections.items():
+            source_name = self.shared_feature_source[target_name]
             node_last_layer_features_dict[target_name] = [
                 node_proj[i](feat)
                 for i, feat in enumerate(node_last_layer_features_dict[source_name])
             ]
+        for target_name, edge_proj in self.edge_shared_projections.items():
+            source_name = self.shared_feature_source[target_name]
             edge_last_layer_features_dict[target_name] = [
                 edge_proj[i](feat)
                 for i, feat in enumerate(edge_last_layer_features_dict[source_name])
