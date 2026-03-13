@@ -265,6 +265,17 @@ def model_update_v10_v11(checkpoint: dict) -> None:
         checkpoint["model_data"]["model_hypers"]["attention_temperature"] = 1.0
 
 
+def model_update_v11_v12(checkpoint: dict) -> None:
+    """
+    Update a v11 checkpoint to v12.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    # Adding shared_targets support (default: no shared targets)
+    if "shared_targets" not in checkpoint["model_data"]["model_hypers"]:
+        checkpoint["model_data"]["model_hypers"]["shared_targets"] = {}
+
+
 ###########################
 # TRAINER #################
 ###########################
