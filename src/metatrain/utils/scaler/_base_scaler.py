@@ -481,64 +481,59 @@ class BaseScaler(torch.nn.Module):
         Apply fixed weights to the scales of a given target.
 
         :param target_name: Name of the target to which fixed weights should be applied.
-        :param weights: Either a single float value to be applied to all atomic types,
-            or a dict mapping atomic type (int) to weight (float).
+        :param weights: Either a single float value to be applied to all atomic types
+            and all subtargets, or a dict mapping atomic type (int) to weight (float)
+            which is broadcast across all subtargets/properties.
         """
-        # Error out if multiple blocks are present. These are difficult to allow
-        # in the yaml files.
-        if len(self.scales[target_name]) > 1:
-            raise NotImplementedError(
-                "Multiple blocks are not supported for fixed weights in `Scaler` "
-                f"for target '{target_name}'"
-            )
+        is_dict = isinstance(weights, dict)
+        is_scalar = isinstance(weights, (int, float)) and not isinstance(weights, bool)
 
-        Y2_block = self.Y2[target_name].block()
-        block = TensorBlock(
-            values=torch.empty_like(Y2_block.values),  # [n_types, n_props]
-            samples=Y2_block.samples,
-            components=Y2_block.components,
-            properties=Y2_block.properties,
-        )
-
-        if isinstance(weights, dict):
-            # dict weights are per-atomic-type and target a single property column
-            if len(self.scales[target_name].block().properties) > 1:
-                raise NotImplementedError(
-                    "Multiple properties are not supported for dict-valued fixed "
-                    f"weights in `Scaler` for target '{target_name}'"
-                )
-            for atomic_type in self.atomic_types.tolist():
-                # Error out if `weights` is a dict but the target is per-structure
-                if self.sample_kinds[target_name] == "per_structure":
-                    raise ValueError(
-                        "Fixed weights as a dict are not supported for per-structure "
-                        f"target '{target_name}'"
-                    )
-                # Error out if any atomic types are missing
-                if int(atomic_type) not in weights:
-                    raise ValueError(
-                        f"Atomic type {atomic_type} is missing from the fixed scaling "
-                        f"weights for target '{target_name}'"
-                    )
-                for atom_type, weight in weights.items():
-                    block.values[self.type_to_index[atom_type], 0] = weight
-        elif isinstance(weights, float):
-            if self.sample_kinds[target_name] == "per_atom":
-                logging.info(
-                    "Fixed weights provided as a single float for per-atom "
-                    f"target '{target_name}'. The same weight will be applied to "
-                    "all atomic types."
-                )
-            block.values[:] = weights
-        else:
+        if not is_dict and not is_scalar:
             raise ValueError(
                 f"weights for '{target_name}' must be either a float or a dict of "
                 "int to float."
             )
 
+        if is_scalar and self.sample_kinds[target_name] == "per_atom":
+            logging.info(
+                "Fixed weights provided as a single float for per-atom "
+                f"target '{target_name}'. The same weight will be applied to "
+                "all atomic types and subtargets."
+            )
+
+        blocks = []
+        for key in self.Y2[target_name].keys:
+            Y2_block = self.Y2[target_name][key]
+            block = TensorBlock(
+                values=torch.empty_like(Y2_block.values),  # [n_types, n_props]
+                samples=Y2_block.samples,
+                components=Y2_block.components,
+                properties=Y2_block.properties,
+            )
+
+            if is_scalar:
+                block.values[:] = float(weights)
+            else:
+                # dict: per-atomic-type weights broadcast across all property columns
+                if self.sample_kinds[target_name] == "per_structure":
+                    raise ValueError(
+                        "Fixed weights as a dict are not supported for per-structure "
+                        f"target '{target_name}'"
+                    )
+                for atomic_type in self.atomic_types.tolist():
+                    if int(atomic_type) not in weights:
+                        raise ValueError(
+                            f"Atomic type {atomic_type} is missing from the fixed "
+                            f"scaling weights for target '{target_name}'"
+                        )
+                for atom_type, weight in weights.items():
+                    block.values[self.type_to_index[int(atom_type)], :] = weight
+
+            blocks.append(block)
+
         self.scales[target_name] = TensorMap(
-            self.Y2[target_name].keys.to(device=block.values.device),
-            [block],
+            self.Y2[target_name].keys.to(device=blocks[0].values.device),
+            blocks,
         )
 
     def _sync_device_dtype(self, device: torch.device, dtype: torch.dtype) -> None:

@@ -628,22 +628,30 @@ def expand_loss_config(conf: DictConfig) -> DictConfig:
                 # forces -> positions
                 if has_forces_key:
                     fval = raw["forces"]
-                    cfg = (
-                        {"type": fval}
-                        if isinstance(fval, str)
-                        else OmegaConf.to_container(fval, resolve=False)
-                    )
-                    gradient_overrides["positions"] = cfg
+                    if isinstance(fval, bool):
+                        if fval:
+                            gradient_overrides["positions"] = {}
+                        # False means disabled — don't add to gradient_overrides
+                    elif isinstance(fval, str):
+                        gradient_overrides["positions"] = {"type": fval}
+                    else:
+                        gradient_overrides["positions"] = OmegaConf.to_container(
+                            fval, resolve=False
+                        )
 
                 # stress/virial -> strain
                 if has_stress_key or has_virial_key:
                     sval = raw["stress"] if has_stress_key else raw["virial"]
-                    cfg = (
-                        {"type": sval}
-                        if isinstance(sval, str)
-                        else OmegaConf.to_container(sval, resolve=False)
-                    )
-                    gradient_overrides["strain"] = cfg
+                    if isinstance(sval, bool):
+                        if sval:
+                            gradient_overrides["strain"] = {}
+                        # False means disabled — don't add to gradient_overrides
+                    elif isinstance(sval, str):
+                        gradient_overrides["strain"] = {"type": sval}
+                    else:
+                        gradient_overrides["strain"] = OmegaConf.to_container(
+                            sval, resolve=False
+                        )
 
             # Explicit gradients section
             gnode = raw.get("gradients")
