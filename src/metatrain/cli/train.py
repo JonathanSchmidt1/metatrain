@@ -417,23 +417,32 @@ def train_model(
             options["test_set"]["indices_file"]
         )
         train_dataset = train_datasets[0]
-        test_set = set(loaded_test_indices)
-        remaining_train_indices = sorted(
-            set(range(len(train_dataset))) - test_set
-        )
-        # remap if there was already a validation split (train_dataset may be a Subset)
         there_was_no_validation_split = train_indices[0] is None
         if there_was_no_validation_split:
-            new_train_indices = remaining_train_indices
-            new_test_indices = loaded_test_indices
+            # train_dataset is the original; loaded indices are absolute = relative
+            test_set = set(loaded_test_indices)
+            remaining_rel = sorted(set(range(len(train_dataset))) - test_set)
+            train_datasets[0] = Subset(train_dataset, remaining_rel)
+            test_datasets.append(Subset(train_dataset, loaded_test_indices))
+            train_indices[0] = remaining_rel
+            test_indices.append(loaded_test_indices)
         else:
+            # train_dataset is a Subset after the val split.
+            # loaded_test_indices are absolute indices into the original dataset.
+            # prev holds the absolute indices currently in the training set.
             prev = train_indices[0]
-            new_train_indices = [prev[i] for i in remaining_train_indices]
-            new_test_indices = [prev[i] for i in loaded_test_indices]
-        train_datasets[0] = Subset(train_dataset, remaining_train_indices)
-        test_datasets.append(Subset(train_dataset, loaded_test_indices))
-        test_indices.append(new_test_indices)
-        train_indices[0] = new_train_indices
+            prev_set = set(prev)
+            test_abs = set(loaded_test_indices)
+            remaining_abs = sorted(prev_set - test_abs)
+            test_abs_in_prev = sorted(test_abs & prev_set)
+            # Convert absolute → relative within the current Subset
+            abs_to_rel = {a: r for r, a in enumerate(prev)}
+            remaining_rel = [abs_to_rel[a] for a in remaining_abs]
+            test_rel = [abs_to_rel[a] for a in test_abs_in_prev]
+            train_datasets[0] = Subset(train_dataset, remaining_rel)
+            test_datasets.append(Subset(train_dataset, test_rel))
+            train_indices[0] = remaining_abs
+            test_indices.append(test_abs_in_prev)
     else:
         options["test_set"] = expand_dataset_config(options["test_set"])
 
