@@ -189,6 +189,19 @@ class DatasetDictHypers(TypedDict):
     """Additional data to include from the dataset."""
 
 
+@with_config(ConfigDict(extra="forbid", strict=True))
+class IndicesFileSpec(TypedDict):
+    """Specifies a subset of the training set via a pre-computed index file.
+
+    The index file should contain one integer index per line (plain text) or be a
+    ``.npy`` file of integers. The indices refer to positions in the training dataset.
+    The complement of these indices becomes the new training set.
+    """
+
+    indices_file: str
+    """Path to a file containing the dataset indices (one per line or ``.npy``)."""
+
+
 DatasetSpec = DatasetDictHypers | list[DatasetDictHypers] | str
 
 WandbConfig = dict
@@ -225,9 +238,11 @@ class BaseHypers(TypedDict):
 
     training_set: DatasetSpec
     """Specification of the training dataset."""
-    validation_set: DatasetSpec | Annotated[int | float, Interval(ge=0.0, lt=1.0)]
+    validation_set: (
+        DatasetSpec | IndicesFileSpec | Annotated[int | float, Interval(ge=0.0, lt=1.0)]
+    )
     """Specification of the validation dataset."""
     test_set: NotRequired[
-        DatasetSpec | Annotated[int | float, Interval(ge=0.0, lt=1.0)]
+        DatasetSpec | IndicesFileSpec | Annotated[int | float, Interval(ge=0.0, lt=1.0)]
     ]
     """Specification of the test dataset."""

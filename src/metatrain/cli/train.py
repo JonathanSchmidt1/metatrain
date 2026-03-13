@@ -13,6 +13,7 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 
 from metatrain.utils.data import Dataset
+from torch.utils.data import Subset
 
 from ..utils.abc import ModelInterface, TrainerInterface
 from ..utils.architectures import (
@@ -27,7 +28,11 @@ from ..utils.data import (
     get_dataset,
     get_stats,
 )
-from ..utils.data.dataset import _save_indices, _train_test_random_split
+from ..utils.data.dataset import (
+    _load_indices_from_file,
+    _save_indices,
+    _train_test_random_split,
+)
 from ..utils.devices import pick_devices
 from ..utils.distributed.logging import is_main_process
 from ..utils.errors import ArchitectureError, OutOfMemoryError
@@ -325,6 +330,27 @@ def train_model(
             val_datasets.append(val_dataset)
             train_indices.append(train_dataset_new.indices)
             val_indices.append(val_dataset.indices)
+    elif (
+        isinstance(options["validation_set"], (dict, DictConfig))
+        and "indices_file" in options["validation_set"]
+    ):
+        if len(train_datasets) != 1:
+            raise ValueError(
+                "indices_file validation_set is only supported with a single "
+                "training dataset."
+            )
+        loaded_val_indices = _load_indices_from_file(
+            options["validation_set"]["indices_file"]
+        )
+        train_dataset = train_datasets[0]
+        val_set = set(loaded_val_indices)
+        remaining_train_indices = sorted(
+            set(range(len(train_dataset))) - val_set
+        )
+        train_datasets[0] = Subset(train_dataset, remaining_train_indices)
+        val_datasets.append(Subset(train_dataset, loaded_val_indices))
+        train_indices.append(remaining_train_indices)
+        val_indices.append(loaded_val_indices)
     else:
         options["validation_set"] = expand_dataset_config(options["validation_set"])
 
@@ -378,6 +404,36 @@ def train_model(
                 else [train_indices[i_dataset][i] for i in test_dataset.indices]
             )
             train_indices[i_dataset] = new_train_indices
+    elif (
+        isinstance(options["test_set"], (dict, DictConfig))
+        and "indices_file" in options["test_set"]
+    ):
+        if len(train_datasets) != 1:
+            raise ValueError(
+                "indices_file test_set is only supported with a single "
+                "training dataset."
+            )
+        loaded_test_indices = _load_indices_from_file(
+            options["test_set"]["indices_file"]
+        )
+        train_dataset = train_datasets[0]
+        test_set = set(loaded_test_indices)
+        remaining_train_indices = sorted(
+            set(range(len(train_dataset))) - test_set
+        )
+        # remap if there was already a validation split (train_dataset may be a Subset)
+        there_was_no_validation_split = train_indices[0] is None
+        if there_was_no_validation_split:
+            new_train_indices = remaining_train_indices
+            new_test_indices = loaded_test_indices
+        else:
+            prev = train_indices[0]
+            new_train_indices = [prev[i] for i in remaining_train_indices]
+            new_test_indices = [prev[i] for i in loaded_test_indices]
+        train_datasets[0] = Subset(train_dataset, remaining_train_indices)
+        test_datasets.append(Subset(train_dataset, loaded_test_indices))
+        test_indices.append(new_test_indices)
+        train_indices[0] = new_train_indices
     else:
         options["test_set"] = expand_dataset_config(options["test_set"])
 

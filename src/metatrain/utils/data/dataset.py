@@ -782,6 +782,15 @@ def _is_disk_dataset(dataset: Any) -> bool:
     return False
 
 
+def _load_indices_from_file(indices_file: Union[str, Path]) -> List[int]:
+    """Load dataset indices from a text or numpy file."""
+    indices_file = str(indices_file)
+    if indices_file.endswith(".npy"):
+        return np.load(indices_file).astype(int).tolist()
+    else:
+        return np.loadtxt(indices_file, dtype=int).tolist()
+
+
 def _save_indices(
     train_indices: List[Optional[List[int]]],
     val_indices: List[Optional[List[int]]],
