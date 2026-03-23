@@ -62,6 +62,7 @@ from typing import Literal, Optional
 
 from typing_extensions import TypedDict
 
+from metatrain.pet.modules.finetuning import FinetuneHypers, NoFinetuneHypers
 from metatrain.utils.additive import FixedCompositionWeights
 from metatrain.utils.hypers import init_with_defaults
 from metatrain.utils.loss import LossSpecification
@@ -313,3 +314,14 @@ class TrainerHypers(TypedDict):
 
     loss: str | dict[str, LossSpecification] = "mse"
     """Loss function used for training."""
+
+    finetune: NoFinetuneHypers | FinetuneHypers = {
+        "read_from": None,
+        "method": "full",
+        "config": {},
+        "inherit_heads": {},
+    }
+    """Parameters for fine-tuning trained PhACE models.
+
+    See :ref:`label_fine_tuning_concept` for more details.
+    """

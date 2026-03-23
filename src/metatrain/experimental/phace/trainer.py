@@ -36,6 +36,8 @@ from metatrain.utils.per_atom import average_by_num_atoms
 from metatrain.utils.scaler import get_remove_scale_transform
 from metatrain.utils.transfer import batch_to
 
+from metatrain.pet.modules.finetuning import apply_finetuning_strategy
+
 from . import checkpoints
 from .documentation import TrainerHypers
 from .model import PhACE
@@ -158,6 +160,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
         assert dtype in PhACE.__supported_dtypes__
 
         is_distributed = self.hypers["distributed"]
+        is_finetune = self.hypers["finetune"]["read_from"] is not None
 
         if is_distributed:
             if len(devices) > 1:
@@ -183,6 +186,28 @@ class Trainer(TrainerInterface[TrainerHypers]):
             logging.info(f"Training on {world_size} devices with dtype {dtype}")
         else:
             logging.info(f"Training on device {device} with dtype {dtype}")
+
+        # Apply fine-tuning strategy if provided
+        if is_finetune:
+            assert self.hypers["finetune"]["read_from"] is not None  # for mypy
+            model = apply_finetuning_strategy(model, self.hypers["finetune"])
+            method = self.hypers["finetune"]["method"]
+            num_params = sum(p.numel() for p in model.parameters())
+            num_trainable_params = sum(
+                p.numel() for p in model.parameters() if p.requires_grad
+            )
+            logging.info(f"Applied finetuning strategy: {method}")
+            logging.info(
+                f"Number of trainable parameters: {num_trainable_params} "
+                f"[{num_trainable_params / num_params:.2%} %]"
+            )
+            inherit_heads = self.hypers["finetune"]["inherit_heads"]
+            if inherit_heads:
+                logging.info(
+                    "Inheriting initial weights for heads and last layers for targets: "
+                    f"from {list(inherit_heads.values())} to "
+                    f"{list(inherit_heads.keys())}"
+                )
 
         # Move the model to the device and dtype:
         model.to(device=device, dtype=dtype)
