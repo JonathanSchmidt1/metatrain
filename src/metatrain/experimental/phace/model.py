@@ -179,6 +179,11 @@ class PhACE(ModelInterface[ModelHypers]):
         # register new outputs as new last layers
         for target_name, target in new_targets.items():
             self._add_output(target_name, target)
+            self.fake_gradient_model.module._add_output(target_name, target)
+            ll_features_name = (
+                f"mtt::aux::{target_name.replace('mtt::', '')}_last_layer_features"
+            )
+            self.outputs[ll_features_name] = ModelOutput(per_atom=True)
 
         self.dataset_info = merged_info
 
