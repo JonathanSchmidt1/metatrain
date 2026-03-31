@@ -21,6 +21,7 @@ class LossParams(TypedDict):
     type: NotRequired[str] = "mse"
     weight: NotRequired[float] = 1.0
     reduction: NotRequired[Literal["none", "mean", "sum"]] = "mean"
+    nan_handling: NotRequired[Literal["filter", "mean"]] = "filter"
 
 
 @with_config(ConfigDict(extra="allow"))
@@ -28,6 +29,7 @@ class LossSpecification(TypedDict):
     type: NotRequired[str] = "mse"
     weight: NotRequired[float] = 1.0
     reduction: NotRequired[Literal["none", "mean", "sum"]] = "mean"
+    nan_handling: NotRequired[Literal["filter", "mean"]] = "filter"
     gradients: NotRequired[dict[str, LossParams]] = {}
 
 
@@ -136,9 +138,11 @@ class BaseTensorMapLoss(LossInterface):
         reduction: str,
         *,
         loss_fn: _Loss,
+        nan_handling: str = "filter",
     ):
         super().__init__(name, gradient, weight, reduction)
         self.torch_loss = loss_fn
+        self.nan_handling = nan_handling
 
     def compute_flattened(
         self,
@@ -150,64 +154,76 @@ class BaseTensorMapLoss(LossInterface):
         Flatten prediction and target blocks (and optional mask), then
         apply the torch loss.
 
+        NaN target values are handled according to ``self.nan_handling``:
+
+        - ``"filter"``: NaN entries are removed from both predictions and targets.
+        - ``"mean"``: samples whose targets are entirely NaN get their targets
+          replaced by the per-property mean of the valid samples in the same
+          block.  This acts as a regularizer that pulls predictions for
+          missing-data samples toward the center of the valid target
+          distribution.
+
         :param tensor_map_predictions_for_target: predicted :py:class:`TensorMap`.
         :param tensor_map_targets_for_target: target :py:class:`TensorMap`.
         :param tensor_map_mask_for_target: optional mask :py:class:`TensorMap`.
         :return: scalar torch.Tensor of the computed loss.
         """
-        list_of_prediction_segments = []
-        list_of_target_segments = []
+        list_of_prediction_segments: list[torch.Tensor] = []
+        list_of_target_segments: list[torch.Tensor] = []
 
-        def extract_flattened_values_from_block(
-            tensor_block: mts.TensorBlock,
-        ) -> torch.Tensor:
-            """
-            Extract values or gradients from a block, flatten to 1D.
-
-            :param tensor_block: input :py:class:`TensorBlock`.
-            :return: flattened torch.Tensor.
-            """
+        def _get_values(block: mts.TensorBlock) -> torch.Tensor:
             if self.gradient is not None:
-                values = tensor_block.gradient(self.gradient).values
-            else:
-                values = tensor_block.values
-            return values.reshape(-1)
+                return block.gradient(self.gradient).values
+            return block.values
 
-        # Loop over each key in the TensorMap
         for single_key in tensor_map_predictions_for_target.keys:
-            block_for_prediction = tensor_map_predictions_for_target.block(single_key)
-            block_for_target = tensor_map_targets_for_target.block(single_key)
+            block_pred = tensor_map_predictions_for_target.block(single_key)
+            block_targ = tensor_map_targets_for_target.block(single_key)
 
-            flattened_prediction = extract_flattened_values_from_block(
-                block_for_prediction
-            )
-            flattened_target = extract_flattened_values_from_block(block_for_target)
+            pred_vals = _get_values(block_pred)
+            targ_vals = _get_values(block_targ)
 
             if tensor_map_mask_for_target is not None:
-                # Apply boolean mask if provided
-                block_for_mask = tensor_map_mask_for_target.block(single_key)
-                flattened_mask = extract_flattened_values_from_block(
-                    block_for_mask
-                ).bool()
-                flattened_prediction = flattened_prediction[flattened_mask]
-                flattened_target = flattened_target[flattened_mask]
+                block_mask = tensor_map_mask_for_target.block(single_key)
+                mask_flat = _get_values(block_mask).reshape(-1).bool()
+                list_of_prediction_segments.append(pred_vals.reshape(-1)[mask_flat])
+                list_of_target_segments.append(targ_vals.reshape(-1)[mask_flat])
+                continue
 
-            list_of_prediction_segments.append(flattened_prediction)
-            list_of_target_segments.append(flattened_target)
+            # Handle NaN targets universally
+            nan_mask = torch.isnan(targ_vals)
+            if nan_mask.any():
+                if self.nan_handling == "mean":
+                    # Identify samples with any NaN (whole sample is missing)
+                    sample_nan = nan_mask.flatten(start_dim=1).any(dim=1)
+                    sample_valid = ~sample_nan
+                    if not sample_valid.any():
+                        continue  # entire block is NaN, skip
+                    # Per-property mean of valid samples
+                    valid_mean = targ_vals[sample_valid].mean(dim=0, keepdim=True)
+                    targ_vals = targ_vals.clone()
+                    targ_vals[sample_nan] = valid_mean.expand_as(targ_vals[sample_nan])
+                else:  # "filter"
+                    valid_flat = ~nan_mask.reshape(-1)
+                    list_of_prediction_segments.append(
+                        pred_vals.reshape(-1)[valid_flat]
+                    )
+                    list_of_target_segments.append(targ_vals.reshape(-1)[valid_flat])
+                    continue
 
-        # Concatenate all segments and apply the torch loss
+            list_of_prediction_segments.append(pred_vals.reshape(-1))
+            list_of_target_segments.append(targ_vals.reshape(-1))
+
+        if not list_of_prediction_segments:
+            block = tensor_map_predictions_for_target.block(
+                tensor_map_predictions_for_target.keys[0]
+            )
+            return torch.zeros((), dtype=block.values.dtype, device=block.values.device)
+
         all_predictions_flattened = torch.cat(list_of_prediction_segments)
         all_targets_flattened = torch.cat(list_of_target_segments)
 
-        # Filter out non-finite (NaN or inf) target values. This allows users to
-        # mark missing entries by writing NaN, and also guards against inf values
-        # from data normalization issues or improper missing-value markers.
-        valid_mask = torch.isfinite(all_targets_flattened)
-        all_predictions_flattened = all_predictions_flattened[valid_mask]
-        all_targets_flattened = all_targets_flattened[valid_mask]
-
         if len(all_targets_flattened) == 0:
-            # No valid data points to compute the loss
             return torch.zeros(
                 (),
                 dtype=all_predictions_flattened.dtype,
@@ -292,6 +308,7 @@ class TensorMapMSELoss(BaseTensorMapLoss):
     :param gradient: optional gradient field name.
     :param weight: weight of the loss contribution in the final aggregation.
     :param reduction: reduction mode for torch loss.
+    :param nan_handling: how to handle NaN targets ("filter" or "mean").
     """
 
     def __init__(
@@ -300,6 +317,7 @@ class TensorMapMSELoss(BaseTensorMapLoss):
         gradient: Optional[str],
         weight: float,
         reduction: str,
+        **kwargs,
     ):
         super().__init__(
             name,
@@ -307,6 +325,7 @@ class TensorMapMSELoss(BaseTensorMapLoss):
             weight,
             reduction,
             loss_fn=torch.nn.MSELoss(reduction=reduction),
+            **kwargs,
         )
 
 
@@ -318,6 +337,7 @@ class TensorMapMAELoss(BaseTensorMapLoss):
     :param gradient: optional gradient field name.
     :param weight: weight of the loss contribution in the final aggregation.
     :param reduction: reduction mode for torch loss.
+    :param nan_handling: how to handle NaN targets ("filter" or "mean").
     """
 
     def __init__(
@@ -326,6 +346,7 @@ class TensorMapMAELoss(BaseTensorMapLoss):
         gradient: Optional[str],
         weight: float,
         reduction: str,
+        **kwargs,
     ):
         super().__init__(
             name,
@@ -333,6 +354,7 @@ class TensorMapMAELoss(BaseTensorMapLoss):
             weight,
             reduction,
             loss_fn=torch.nn.L1Loss(reduction=reduction),
+            **kwargs,
         )
 
 
@@ -345,6 +367,7 @@ class TensorMapHuberLoss(BaseTensorMapLoss):
     :param weight: weight of the loss contribution in the final aggregation.
     :param reduction: reduction mode for torch loss.
     :param delta: threshold parameter for HuberLoss.
+    :param nan_handling: how to handle NaN targets ("filter" or "mean").
     """
 
     def __init__(
@@ -354,6 +377,7 @@ class TensorMapHuberLoss(BaseTensorMapLoss):
         weight: float,
         reduction: str,
         delta: float,
+        **kwargs,
     ):
         super().__init__(
             name,
@@ -361,6 +385,7 @@ class TensorMapHuberLoss(BaseTensorMapLoss):
             weight,
             reduction,
             loss_fn=torch.nn.HuberLoss(reduction=reduction, delta=delta),
+            **kwargs,
         )
 
 
@@ -390,7 +415,7 @@ class GlobalSignInvariantLoss(BaseTensorMapLoss):
     def _align_block_signs(
         pred_block: TensorBlock, targ_block: TensorBlock
     ) -> TensorBlock:
-        """Return a copy of *targ_block* with per-structure sign aligned to *pred_block*.
+        """Return a copy of *targ_block* with per-structure sign aligned.
 
         :param pred_block: block of model predictions.
         :param targ_block: block of reference targets.
@@ -464,6 +489,7 @@ class GlobalSignInvariantMSELoss(GlobalSignInvariantLoss):
         gradient: Optional[str],
         weight: float,
         reduction: str,
+        **kwargs,
     ):
         super().__init__(
             name,
@@ -471,6 +497,7 @@ class GlobalSignInvariantMSELoss(GlobalSignInvariantLoss):
             weight,
             reduction,
             loss_fn=torch.nn.MSELoss(reduction=reduction),
+            **kwargs,
         )
 
 
@@ -490,6 +517,7 @@ class GlobalSignInvariantMAELoss(GlobalSignInvariantLoss):
         gradient: Optional[str],
         weight: float,
         reduction: str,
+        **kwargs,
     ):
         super().__init__(
             name,
@@ -497,6 +525,7 @@ class GlobalSignInvariantMAELoss(GlobalSignInvariantLoss):
             weight,
             reduction,
             loss_fn=torch.nn.L1Loss(reduction=reduction),
+            **kwargs,
         )
 
 
@@ -518,6 +547,7 @@ class GlobalSignInvariantHuberLoss(GlobalSignInvariantLoss):
         weight: float,
         reduction: str,
         delta: float,
+        **kwargs,
     ):
         super().__init__(
             name,
@@ -525,6 +555,7 @@ class GlobalSignInvariantHuberLoss(GlobalSignInvariantLoss):
             weight,
             reduction,
             loss_fn=torch.nn.HuberLoss(reduction=reduction, delta=delta),
+            **kwargs,
         )
 
 
@@ -544,6 +575,7 @@ class TensorMapMaskedMSELoss(MaskedTensorMapLoss):
         gradient: Optional[str],
         weight: float,
         reduction: str,
+        **kwargs,
     ):
         super().__init__(
             name,
@@ -551,6 +583,7 @@ class TensorMapMaskedMSELoss(MaskedTensorMapLoss):
             weight,
             reduction,
             loss_fn=torch.nn.MSELoss(reduction=reduction),
+            **kwargs,
         )
 
 
@@ -570,6 +603,7 @@ class TensorMapMaskedMAELoss(MaskedTensorMapLoss):
         gradient: Optional[str],
         weight: float,
         reduction: str,
+        **kwargs,
     ):
         super().__init__(
             name,
@@ -577,6 +611,7 @@ class TensorMapMaskedMAELoss(MaskedTensorMapLoss):
             weight,
             reduction,
             loss_fn=torch.nn.L1Loss(reduction=reduction),
+            **kwargs,
         )
 
 
@@ -598,6 +633,7 @@ class TensorMapMaskedHuberLoss(MaskedTensorMapLoss):
         weight: float,
         reduction: str,
         delta: float,
+        **kwargs,
     ):
         super().__init__(
             name,
@@ -605,6 +641,7 @@ class TensorMapMaskedHuberLoss(MaskedTensorMapLoss):
             weight,
             reduction,
             loss_fn=torch.nn.HuberLoss(reduction=reduction, delta=delta),
+            **kwargs,
         )
 
 
@@ -1404,6 +1441,9 @@ def create_loss(
     :return: instance of the selected loss.
     """
     loss_type_entry = LossType.from_key(loss_type)
+    # nan_handling is only supported by BaseTensorMapLoss subclasses
+    if not issubclass(loss_type_entry.cls, BaseTensorMapLoss):
+        extra_kwargs.pop("nan_handling", None)
     try:
         return loss_type_entry.cls(
             name=name,
