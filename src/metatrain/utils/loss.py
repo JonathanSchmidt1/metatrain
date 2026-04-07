@@ -559,6 +559,102 @@ class GlobalSignInvariantHuberLoss(GlobalSignInvariantLoss):
         )
 
 
+class TensorMapCosineLoss(BaseTensorMapLoss):
+    """
+    Cosine distance loss on :py:class:`TensorMap` entries.
+
+    Computes ``mean(1 - cosine_similarity(pred, target))`` across all samples
+    and blocks. Each sample's properties dimension is used for the similarity,
+    so the loss is meaningful for multi-property targets (e.g. feature vectors).
+
+    :param name: key in the predictions/targets dict.
+    :param gradient: optional gradient field name.
+    :param weight: weight of the loss contribution in the final aggregation.
+    :param reduction: reduction mode (only ``"mean"`` is supported).
+    """
+
+    def __init__(
+        self,
+        name: str,
+        gradient: Optional[str],
+        weight: float,
+        reduction: str,
+        **kwargs,
+    ):
+        super().__init__(
+            name,
+            gradient,
+            weight,
+            reduction,
+            loss_fn=torch.nn.MSELoss(reduction=reduction),
+            **kwargs,
+        )
+
+    def compute_flattened(
+        self,
+        tensor_map_predictions_for_target: TensorMap,
+        tensor_map_targets_for_target: TensorMap,
+        tensor_map_mask_for_target: Optional[TensorMap] = None,
+    ) -> torch.Tensor:
+        """
+        Compute cosine distance averaged over all valid samples across blocks.
+
+        :param tensor_map_predictions_for_target: predicted :py:class:`TensorMap`.
+        :param tensor_map_targets_for_target: target :py:class:`TensorMap`.
+        :param tensor_map_mask_for_target: optional mask (ignored for cosine loss).
+        :return: scalar torch.Tensor of the computed loss.
+        """
+        list_of_cosine_distances: list[torch.Tensor] = []
+
+        def _get_values(block: mts.TensorBlock) -> torch.Tensor:
+            if self.gradient is not None:
+                return block.gradient(self.gradient).values
+            return block.values
+
+        for single_key in tensor_map_predictions_for_target.keys:
+            block_pred = tensor_map_predictions_for_target.block(single_key)
+            block_targ = tensor_map_targets_for_target.block(single_key)
+
+            pred_vals = _get_values(block_pred)
+            targ_vals = _get_values(block_targ)
+
+            # Flatten all dims except the last (properties) into batch dim
+            n_props = pred_vals.shape[-1]
+            pred_flat = pred_vals.reshape(-1, n_props)
+            targ_flat = targ_vals.reshape(-1, n_props)
+
+            # Handle NaN targets: identify valid samples (no NaN in any property)
+            nan_mask = torch.isnan(targ_flat)
+            sample_nan = nan_mask.any(dim=1)
+            sample_valid = ~sample_nan
+
+            if self.nan_handling == "mean":
+                if not sample_valid.any():
+                    continue
+                valid_mean = targ_flat[sample_valid].mean(dim=0, keepdim=True)
+                targ_flat = targ_flat.clone()
+                targ_flat[sample_nan] = valid_mean.expand_as(targ_flat[sample_nan])
+            else:  # "filter"
+                pred_flat = pred_flat[sample_valid]
+                targ_flat = targ_flat[sample_valid]
+                if pred_flat.shape[0] == 0:
+                    continue
+
+            cos_sim = torch.nn.functional.cosine_similarity(
+                pred_flat, targ_flat, dim=-1
+            )
+            list_of_cosine_distances.append(1.0 - cos_sim)
+
+        if not list_of_cosine_distances:
+            block = tensor_map_predictions_for_target.block(
+                tensor_map_predictions_for_target.keys[0]
+            )
+            return torch.zeros((), dtype=block.values.dtype, device=block.values.device)
+
+        all_distances = torch.cat(list_of_cosine_distances)
+        return all_distances.mean()
+
+
 class TensorMapMaskedMSELoss(MaskedTensorMapLoss):
     """
     Masked mean-squared error on :py:class:`TensorMap` entries.
@@ -1389,6 +1485,7 @@ class LossType(Enum):
     GLOBAL_SIGN_MSE = ("global_sign_mse", GlobalSignInvariantMSELoss)
     GLOBAL_SIGN_MAE = ("global_sign_mae", GlobalSignInvariantMAELoss)
     GLOBAL_SIGN_HUBER = ("global_sign_huber", GlobalSignInvariantHuberLoss)
+    COSINE = ("cosine", TensorMapCosineLoss)
 
     def __init__(self, key: str, cls: Type[LossInterface]) -> None:
         self._key = key
