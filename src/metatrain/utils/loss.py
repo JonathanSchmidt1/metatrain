@@ -4,7 +4,7 @@
 import math
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Any, Dict, Literal, Optional, Type
+from typing import Any, Dict, List, Literal, Optional, Type
 
 import metatensor.torch as mts
 import torch
@@ -281,6 +281,61 @@ class MaskedTensorMapLoss(BaseTensorMapLoss):
 # ------------------------------------------------------------------------
 # Simple explicit subclasses for common pointwise losses
 # ------------------------------------------------------------------------
+
+
+class TensorMapNMAELoss(LossInterface):
+    """
+    Normalized Mean Absolute Error loss for per-structure TensorMap targets.
+
+    Computes ``sum|pred - ref| / sum|ref|`` independently for each key-block
+    pair, then averages across blocks.  Intended for charge-density targets
+    where the raw MAE is meaningless without normalisation by the total charge.
+
+    :param name: key in the predictions/targets dict.
+    :param gradient: optional gradient field name (usually ``None`` for density).
+    :param weight: weight of the loss contribution in the final aggregation.
+    :param reduction: ignored (kept for API compatibility with other loss types).
+    :param eps: small value added to the denominator for numerical stability.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        gradient: Optional[str],
+        weight: float,
+        reduction: str,
+        eps: float = 1e-10,
+    ) -> None:
+        super().__init__(name, gradient, weight, reduction)
+        self.eps = eps
+
+    def compute(
+        self,
+        predictions: Dict[str, TensorMap],
+        targets: Dict[str, TensorMap],
+        extra_data: Optional[Any] = None,
+    ) -> torch.Tensor:
+        """
+        Compute NMAE loss.
+
+        :param predictions: mapping from target names to predicted TensorMaps.
+        :param targets: mapping from target names to reference TensorMaps.
+        :param extra_data: unused.
+        :return: scalar NMAE loss.
+        """
+        pred_tmap = predictions[self.target]
+        ref_tmap = targets[self.target]
+
+        block_losses: List[torch.Tensor] = []
+        for key in pred_tmap.keys:
+            pred_vals = pred_tmap.block(key).values.reshape(-1)
+            ref_vals = ref_tmap.block(key).values.reshape(-1)
+            nmae = pred_vals.sub(ref_vals).abs().sum() / (
+                ref_vals.abs().sum() + self.eps
+            )
+            block_losses.append(nmae)
+
+        return torch.stack(block_losses).mean()
 
 
 class TensorMapMSELoss(BaseTensorMapLoss):
@@ -1338,6 +1393,7 @@ class LossType(Enum):
 
     MSE = ("mse", TensorMapMSELoss)
     MAE = ("mae", TensorMapMAELoss)
+    NMAE = ("nmae", TensorMapNMAELoss)
     HUBER = ("huber", TensorMapHuberLoss)
     MASKED_MSE = ("masked_mse", TensorMapMaskedMSELoss)
     MASKED_MAE = ("masked_mae", TensorMapMaskedMAELoss)
