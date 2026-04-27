@@ -1,5 +1,5 @@
 """
-Dyadic neighbor aggregation layer (ELECTRAFY Appendix B).
+Dyadic neighbor aggregation layer (ELECTRAFY Appendix B.1, Eqs 19-26).
 
 Converts PET's per-layer node/edge features into three geometric channels:
   - S (N_atoms, C)       : scalar features (for Gaussian weights)
@@ -8,28 +8,34 @@ Converts PET's per-layer node/edge features into three geometric channels:
 
 Architecture
 ------------
-Scalar branch
-  S_{i,c} = Linear(d_node -> C)(node_emb_i)
+Scalar branch (Eq 19)
+  S_{i,c} = MLP(node_emb_i)
 
-Vector branch
-  alpha_{i,e,c} = softmax_e( Linear(d_edge -> C)(edge_emb_{i,e}) )
-  n_hat_{i,e}   = edge_vec_{i,e} / ||edge_vec_{i,e}||          (unit vector)
-  v_raw_{i,c}   = sum_e alpha_{i,e,c} * n_hat_{i,e}            (N,C,3)
-  m_{i,c}       = Linear(d_node -> C)(node_emb_i)              (magnitude)
-  V_{i,c}       = (v_raw_{i,c} / ||v_raw_{i,c}||) * m_{i,c}
+Vector branch (Eqs 20-22) — with learned carrier vector
+  d_bar^v_{i,e} = Linear_v(edge_emb_{i,e})              (free per-edge vector)
+  a^v_{i,e}     = sigmoid(Linear_g_v(edge_emb_{i,e}))   (per-edge gate)
+  n^v_{i,e}     = (1 - a^v) n_{i,e} + a^v d_bar^v_{i,e}  (Eq 20)
+  n_hat^v       = n^v / ||n^v||                          (Eq 21)
+  alpha_{i,c,e} = softmax_e( Linear_a_v(edge_emb)_{i,e,c} )
+  v_{i,c}       = sum_e alpha_{i,c,e} n_hat^v_{i,e}      (Eq 22a)
+  m_{i,c}       = softplus(Linear_m(node_emb_i))         (positive magnitude)
+  V_{i,c}       = (v_{i,c} / ||v_{i,c}||) * m_{i,c}      (Eq 22b)
 
-Tensor branch
-  Q_{i,e}       = n_hat n_hat^T - (1/3) I                      (traceless dyad, N,E,3,3)
-  beta_{i,e,c}  = softmax_e( Linear(d_edge -> C)(edge_emb_{i,e}) )
-  T_aniso_{i,c} = sum_e beta_{i,e,c} * Q_{i,e}                 (N,C,3,3)
-  kappa_{i,c}   = Linear(d_node -> C)(node_emb_i)
-  T_{i,c}       = T_aniso_{i,c} + kappa_{i,c} * I
+Tensor branch (Eqs 23-24) — with its own carrier vector
+  d_bar^t_{i,e} = Linear_t(edge_emb_{i,e})
+  a^t_{i,e}     = sigmoid(Linear_g_t(edge_emb_{i,e}))
+  n^t_{i,e}     = (1 - a^t) n_{i,e} + a^t d_bar^t_{i,e}
+  n_hat^t       = n^t / ||n^t||
+  Q_{i,e}       = n_hat^t n_hat^t^T - (1/3) I            (traceless dyad)
+  beta_{i,c,e}  = softmax_e( Linear_a_t(edge_emb)_{i,e,c} )
+  T_aniso_{i,c} = sum_e beta_{i,c,e} Q_{i,e}             (Eq 24a)
+  kappa_{i,c}   = Linear_iso(node_emb_i)                 (scalar trace)
+  T_{i,c}       = T_aniso_{i,c} + kappa_{i,c} I          (Eq 24b)
 
-Cross-layer aggregation (ELECTRAFY Eq. 25-26)
-  A^{[l]}_{i,c}   = Linear(d_node -> C)(node_emb^{[l]}_i)     (logits)
-  alpha^{[l]}_{i,c} = softmax_l( A^{[l]}_{i,c} )
-  S_final         = sum_l alpha^{[l]} * S^{[l]}
-  (same for V and T)
+Cross-layer aggregation (Eqs 25-27)
+  A^[l]_{i,c}     = Linear(d_node -> C)(node_emb^[l]_i)     (logits)
+  alpha^[l]_{i,c} = softmax_l( A^[l]_{i,c} )
+  S_final = sum_l alpha^[l] * S^[l]      (same for V and T)
 """
 
 from typing import List, Tuple
@@ -59,19 +65,32 @@ class DyadicAggregationLayer(nn.Module):
         self.n_channels = n_channels
         self.eps = eps
 
-        # Scalar branch
+        # Scalar branch (Eq 19)
         self.scalar_proj = nn.Linear(d_node, n_channels)
 
-        # Vector branch: per-edge attention weights + per-atom magnitude
-        self.vec_attn_proj = nn.Linear(d_edge, n_channels)
-        self.vec_mag_proj = nn.Linear(d_node, n_channels)
+        # Vector branch (Eqs 20-22): own carrier-vector construction
+        self.vec_carrier_proj = nn.Linear(d_edge, 3)        # d̄^v
+        self.vec_gate_proj = nn.Linear(d_edge, 1)           # a^v (pre-sigmoid)
+        self.vec_attn_proj = nn.Linear(d_edge, n_channels)  # alpha logits
+        self.vec_mag_proj = nn.Linear(d_node, n_channels)   # m (pre-softplus)
 
-        # Tensor branch: per-edge attention weights + per-atom isotropic term
-        self.tens_attn_proj = nn.Linear(d_edge, n_channels)
-        self.tens_iso_proj = nn.Linear(d_node, n_channels)
+        # Tensor branch (Eqs 23-24): SEPARATE carrier-vector construction
+        self.tens_carrier_proj = nn.Linear(d_edge, 3)        # d̄^t
+        self.tens_gate_proj = nn.Linear(d_edge, 1)           # a^t (pre-sigmoid)
+        self.tens_attn_proj = nn.Linear(d_edge, n_channels)  # beta logits
+        self.tens_iso_proj = nn.Linear(d_node, n_channels)   # kappa (trace)
 
-        # Cross-layer logits (used by DyadicAggregation to do softmax over layers)
+        # Cross-layer logits (used by DyadicAggregation to softmax over layers)
         self.layer_logit_proj = nn.Linear(d_node, n_channels)
+
+        # Initialize gates so the carrier defaults to ~ pure edge direction
+        # (a ≈ 0 at start). This keeps early-training behavior close to the
+        # bare-edge implementation while giving the gate room to ramp up.
+        with torch.no_grad():
+            self.vec_gate_proj.weight.zero_()
+            self.vec_gate_proj.bias.fill_(-2.0)   # sigmoid(-2) ≈ 0.12
+            self.tens_gate_proj.weight.zero_()
+            self.tens_gate_proj.bias.fill_(-2.0)
 
     def forward(
         self,
@@ -94,58 +113,70 @@ class DyadicAggregationLayer(nn.Module):
         N, E, _ = edge_emb.shape
         C = self.n_channels
         device = node_emb.device
+        dtype = node_emb.dtype
 
-        # ---- Scalar branch ----
+        # ---- Scalar branch (Eq 19) ----
         S = self.scalar_proj(node_emb)  # (N, C)
 
         # ---- Shared geometry ----
         edge_norms = torch.linalg.vector_norm(edge_vectors, dim=-1, keepdim=True).clamp(
             min=self.eps
         )  # (N, E, 1)
-        n_hat = edge_vectors / edge_norms  # (N, E, 3), unit edge directions
+        n_hat = edge_vectors / edge_norms  # (N, E, 3) unit edge direction
 
-        # Softmax mask: set padding edges to -inf before softmax
-        pad_mask_float = padding_mask.float()  # (N, E), 1=real, 0=pad
+        pad_mask_float = padding_mask.to(dtype=dtype)  # (N, E)
         neg_inf_mask = (1.0 - pad_mask_float) * (-1e9)  # (N, E)
+        # Zero out padded edges so they contribute nothing to carrier sums.
+        pad3 = pad_mask_float[:, :, None]  # (N, E, 1)
 
-        # ---- Vector branch ----
-        # Attention weights: (N, E, C)
-        alpha_raw = self.vec_attn_proj(edge_emb)  # (N, E, C)
+        # ---- Vector-branch carrier (Eqs 20-21) ----
+        d_bar_v = self.vec_carrier_proj(edge_emb)            # (N, E, 3)
+        a_v = torch.sigmoid(self.vec_gate_proj(edge_emb))    # (N, E, 1)
+        n_carrier_v = ((1.0 - a_v) * n_hat + a_v * d_bar_v) * pad3
+        n_carrier_v_norm = torch.linalg.vector_norm(
+            n_carrier_v, dim=-1, keepdim=True
+        ).clamp(min=self.eps)
+        n_hat_v = n_carrier_v / n_carrier_v_norm             # (N, E, 3)
+
+        # ---- Vector branch aggregation (Eq 22) ----
+        alpha_raw = self.vec_attn_proj(edge_emb)             # (N, E, C)
         alpha_raw = alpha_raw + neg_inf_mask[:, :, None]
-        alpha = torch.softmax(alpha_raw, dim=1)  # (N, E, C), sums to 1 over E
+        alpha = torch.softmax(alpha_raw, dim=1)              # (N, E, C)
 
-        # Aggregate: v_raw = sum_e alpha_{e,c} * n_hat_e
-        v_raw = torch.einsum("nec, neo -> nco", alpha, n_hat)  # (N, C, 3)
-
-        # Normalize direction and scale by learned magnitude
+        v_raw = torch.einsum("nec, neo -> nco", alpha, n_hat_v)  # (N, C, 3)
         v_norm = torch.linalg.vector_norm(v_raw, dim=-1, keepdim=True).clamp(
             min=self.eps
         )  # (N, C, 1)
-        m = self.vec_mag_proj(node_emb)  # (N, C)
-        V = (v_raw / v_norm) * m[:, :, None]  # (N, C, 3)
+        # Magnitude must be positive (paper: m ∈ R_{>0}).
+        m = torch.nn.functional.softplus(self.vec_mag_proj(node_emb))  # (N, C)
+        V = (v_raw / v_norm) * m[:, :, None]                  # (N, C, 3)
 
-        # ---- Tensor branch ----
-        # Traceless dyad: Q_e = n_hat n_hat^T - (1/3) I
-        I3 = torch.eye(3, device=device, dtype=node_emb.dtype)
+        # ---- Tensor-branch carrier (Eq 23 setup) ----
+        d_bar_t = self.tens_carrier_proj(edge_emb)            # (N, E, 3)
+        a_t = torch.sigmoid(self.tens_gate_proj(edge_emb))    # (N, E, 1)
+        n_carrier_t = ((1.0 - a_t) * n_hat + a_t * d_bar_t) * pad3
+        n_carrier_t_norm = torch.linalg.vector_norm(
+            n_carrier_t, dim=-1, keepdim=True
+        ).clamp(min=self.eps)
+        n_hat_t = n_carrier_t / n_carrier_t_norm              # (N, E, 3)
+
+        # ---- Tensor branch aggregation (Eq 23-24) ----
+        I3 = torch.eye(3, device=device, dtype=dtype)
         Q = (
-            torch.einsum("neo, nep -> neop", n_hat, n_hat)
+            torch.einsum("neo, nep -> neop", n_hat_t, n_hat_t)
             - I3[None, None, :, :] / 3.0
         )  # (N, E, 3, 3)
 
-        # Tensor attention weights: (N, E, C)
-        beta_raw = self.tens_attn_proj(edge_emb)  # (N, E, C)
+        beta_raw = self.tens_attn_proj(edge_emb)              # (N, E, C)
         beta_raw = beta_raw + neg_inf_mask[:, :, None]
-        beta = torch.softmax(beta_raw, dim=1)  # (N, E, C)
-
-        # Aggregate anisotropic part: T_aniso = sum_e beta_{e,c} * Q_e
+        beta = torch.softmax(beta_raw, dim=1)                 # (N, E, C)
         T_aniso = torch.einsum("nec, neop -> ncop", beta, Q)  # (N, C, 3, 3)
 
-        # Add learned isotropic term: kappa * I
-        kappa = self.tens_iso_proj(node_emb)  # (N, C)
-        T = T_aniso + kappa[:, :, None, None] * I3[None, None, :, :]  # (N, C, 3, 3)
+        kappa = self.tens_iso_proj(node_emb)                  # (N, C)
+        T = T_aniso + kappa[:, :, None, None] * I3[None, None, :, :]
 
-        # ---- Cross-layer logits ----
-        logits = self.layer_logit_proj(node_emb)  # (N, C)
+        # ---- Cross-layer logits (Eq 25) ----
+        logits = self.layer_logit_proj(node_emb)              # (N, C)
 
         return S, V, T, logits
 

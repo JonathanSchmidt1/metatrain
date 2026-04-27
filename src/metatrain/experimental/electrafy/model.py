@@ -60,7 +60,7 @@ from .documentation import ModelHypers
 from .modules.dyadic_aggregation import DyadicAggregation
 from .modules.fourier_density import periodic_density_from_gaussians
 from .modules.gaussian_density import GaussianDensityHead
-from .modules.valence import ZVAL_LOOKUP, MAX_ZVAL
+from .modules.valence import ZVAL_LOOKUP, MAX_ZVAL, build_zv_index_lookup
 
 #: Name of the charge-density output as registered in metatrain.
 DENSITY_KEY = "charge_density"
@@ -106,15 +106,26 @@ class ELECTRAFY(ModelInterface[ModelHypers]):
         # C = M * max_ZVAL (total feature channels per atom)
         self.n_channels = self.gaussians_per_electron * MAX_ZVAL
 
+        # -- (Z, v_a) admissible-set embeddings (Appendix B.3) --
+        # Each element-valence pair gets its own embedding row, so the model
+        # can distinguish (e.g.) Mn vs Mn_pv vs Mn_sv. For dataset_info that
+        # doesn't carry per-atom valence annotations, we look up the canonical
+        # default at forward time (matches what VASP/MP wrote into the CHGCAR).
+        self._zv_index = build_zv_index_lookup()
+        n_zv_embeddings = self._zv_index.num_embeddings
+
         # -- PET GNN layers (residual featurization) --
         self.node_embedders = torch.nn.ModuleList(
             [
-                torch.nn.Embedding(num_species, self.d_node)
+                torch.nn.Embedding(n_zv_embeddings, self.d_node)
                 for _ in range(self.num_gnn_layers)
             ]
         )
-        self.edge_embedder = torch.nn.Embedding(num_species, self.d_pet)
+        self.edge_embedder = torch.nn.Embedding(n_zv_embeddings, self.d_pet)
 
+        # Note: CartesianTransformer's internal `neighbor_embedder` is also
+        # indexed by the (Z, v) embedding index (same as our top-level
+        # node/edge embedders), so it must be sized to `n_zv_embeddings`.
         self.gnn_layers = torch.nn.ModuleList(
             [
                 CartesianTransformer(
@@ -129,7 +140,7 @@ class ELECTRAFY(ModelInterface[ModelHypers]):
                     activation=hypers["activation"],
                     attention_temperature=hypers["attention_temperature"],
                     transformer_type=hypers["transformer_type"],
-                    n_atomic_species=num_species,
+                    n_atomic_species=n_zv_embeddings,
                     is_first=(i == 0),
                 )
                 for i in range(self.num_gnn_layers)
@@ -150,13 +161,24 @@ class ELECTRAFY(ModelInterface[ModelHypers]):
             gamma=hypers["gamma"],
         )
 
-        # -- Species lookup: atomic_number -> species index --
+        # -- Species lookup: atomic_number -> (Z, v) embedding index --
+        # Required by `systems_to_batch` which expects a buffer mapping Z to
+        # an integer index used by both node_embedder and edge_embedder.
+        # Without per-atom valence annotations we route every Z through its
+        # canonical (Z, v_canonical) embedding row.
+        max_z = max(self.atomic_types) + 1
         self.register_buffer(
             "species_to_species_index",
-            torch.full((max(self.atomic_types) + 1,), -1, dtype=torch.long),
+            torch.full((max_z,), -1, dtype=torch.long),
         )
-        for idx, z in enumerate(self.atomic_types):
-            self.species_to_species_index[z] = idx
+        for z in self.atomic_types:
+            try:
+                self.species_to_species_index[z] = self._zv_index.canonical_index_for(z)
+            except KeyError:
+                raise ValueError(
+                    f"no admissible (Z, v) entry for atomic number {z}; "
+                    f"add to ADMISSIBLE_ZVALS in modules/valence.py"
+                )
 
         # -- Valence lookup: atomic_number -> ZVAL --
         self.register_buffer("zval_lookup", ZVAL_LOOKUP.clone())
@@ -181,6 +203,21 @@ class ELECTRAFY(ModelInterface[ModelHypers]):
         # Pre-build labels that are reused across forward calls
         self._grid_property_labels: Optional[Labels] = None
         self._n_grid = n_grid
+
+        # Per-batch grid override. When set, :meth:`forward` uses these shapes
+        # instead of ``self.grid_shape`` — one shape per system in the batch
+        # (length must equal ``len(systems)``). Set via
+        # :meth:`set_override_grid_shapes` by the training loop to match each
+        # CHGCAR's native NGXF/NGYF/NGZF. Cleared by
+        # :meth:`clear_override_grid_shapes`.
+        self._override_grid_shapes: Optional[List[Tuple[int, int, int]]] = None
+
+    def set_override_grid_shapes(self, shapes: List[Tuple[int, int, int]]) -> None:
+        """Set per-system output grid shapes for the next forward call."""
+        self._override_grid_shapes = [tuple(s) for s in shapes]  # type: ignore[assignment]
+
+    def clear_override_grid_shapes(self) -> None:
+        self._override_grid_shapes = None
 
     # ------------------------------------------------------------------
     # ModelInterface API
@@ -269,6 +306,19 @@ class ELECTRAFY(ModelInterface[ModelHypers]):
         positions_all = torch.cat([sys.positions for sys in systems], dim=0)
         n_gaussians_per_atom = self.zval_lookup[species] * self.gaussians_per_electron
 
+        # Resolve per-system output grid shapes (paper convention: native
+        # NGXF/NGYF/NGZF). When ``set_override_grid_shapes`` has been called,
+        # those shapes are used; otherwise fall back to ``self.grid_shape``.
+        if self._override_grid_shapes is not None:
+            if len(self._override_grid_shapes) != n_systems:
+                raise ValueError(
+                    f"override grid shapes ({len(self._override_grid_shapes)}) "
+                    f"!= n_systems ({n_systems})"
+                )
+            per_system_shapes = self._override_grid_shapes
+        else:
+            per_system_shapes = [self.grid_shape] * n_systems
+
         density_rows: List[torch.Tensor] = []
         atom_offset = 0
         for sys_idx, system in enumerate(systems):
@@ -290,14 +340,23 @@ class ELECTRAFY(ModelInterface[ModelHypers]):
                 centers=centers,
                 covs=covs,
                 cell=system.cell,
-                grid_shape=self.grid_shape,
+                grid_shape=per_system_shapes[sys_idx],
                 n_electrons=n_elec,
                 chunk_size=self.fourier_chunk_size,
             )
-            density_rows.append(rho.reshape(-1))  # (N1*N2*N3,)
-            atom_offset += n_atoms
+            density_rows.append(rho.reshape(-1))
 
-        density_values = torch.stack(density_rows, dim=0)  # (n_systems, N_grid)
+        # Stacking requires all rows to share the same length. With
+        # variable native grids this holds only for batch_size=1, which is
+        # what the paper uses (real_batch_size: 1). If multiple systems in a
+        # batch happen to share the same grid, stacking still works.
+        grid_sizes = {row.numel() for row in density_rows}
+        if len(grid_sizes) != 1:
+            raise RuntimeError(
+                f"variable native grids in one batch: {grid_sizes}. Use "
+                f"batch_size=1 when training on native CHGCAR grids."
+            )
+        density_values = torch.stack(density_rows, dim=0)
 
         # ---- Wrap in TensorMap ----
         tmap = self._wrap_density_tmap(density_values, n_systems, device)
@@ -394,11 +453,11 @@ class ELECTRAFY(ModelInterface[ModelHypers]):
           - properties: [("grid_point", 0), ..., ("grid_point", N_grid-1)]
           - values: (n_systems, N_grid)
         """
-        if self._grid_property_labels is None or self._grid_property_labels.device != device:
-            self._grid_property_labels = Labels(
-                names=["grid_point"],
-                values=torch.arange(self._n_grid, device=device).unsqueeze(1),
-            )
+        n_grid = int(density_values.shape[1])
+        property_labels = Labels(
+            names=["grid_point"],
+            values=torch.arange(n_grid, device=device).unsqueeze(1),
+        )
 
         sample_vals = torch.arange(n_systems, device=device, dtype=torch.int32).unsqueeze(1)
         sample_labels = Labels(names=["system"], values=sample_vals)
@@ -407,6 +466,6 @@ class ELECTRAFY(ModelInterface[ModelHypers]):
             values=density_values,
             samples=sample_labels,
             components=[],
-            properties=self._grid_property_labels,
+            properties=property_labels,
         )
         return TensorMap(keys=Labels.single().to(device), blocks=[block])

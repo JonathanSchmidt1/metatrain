@@ -21,7 +21,9 @@ from metatrain.experimental.electrafy.modules.chgcar import (
 )
 
 
-CHGCAR_PATH = Path(__file__).resolve().parent / "resources" / "CHGCAR.gz"
+# Repo layout: .../electrafy/CHGCAR (the fixture), .../electrafy/metatrain/...
+REPO_ROOT = Path(__file__).resolve().parents[6]
+CHGCAR_PATH = REPO_ROOT / "CHGCAR"
 
 
 @pytest.fixture(scope="module")

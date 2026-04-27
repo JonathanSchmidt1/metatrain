@@ -30,7 +30,8 @@ from metatrain.utils.data.target_info import TargetInfo
 from metatensor.torch import Labels, TensorBlock, TensorMap
 
 
-CHGCAR_PATH = Path(__file__).resolve().parent / "resources" / "CHGCAR.gz"
+REPO_ROOT = Path(__file__).resolve().parents[6]
+CHGCAR_PATH = REPO_ROOT / "CHGCAR"
 
 
 def _make_density_layout(grid_shape):

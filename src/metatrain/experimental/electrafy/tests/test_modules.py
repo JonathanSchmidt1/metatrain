@@ -313,10 +313,16 @@ class TestGaussianDensityHead:
         assert weights.shape == (5,)
         assert torch.all(atom_idx == 0)
 
-    def test_weights_include_negative(self, head):
-        """Weights can be negative (tanh allows it)."""
-        torch.manual_seed(42)
-        N, C = 10, 12
+    def test_weights_signed(self, head):
+        """Weights are w = tanh(MLP(S)) per ELECTRAFY Eq 13: signed, in (-1, 1).
+
+        The MLP's output sign depends on its random init, so we directly
+        verify the constituent operations: the MLP is real-valued (so its
+        output can take either sign in expectation), and tanh preserves sign
+        (so weights inherit MLP sign). This avoids flakiness from the head
+        fixture's random init landing on a one-signed regime.
+        """
+        N, C = 8, 12
         S = torch.randn(N, C)
         V = torch.randn(N, C, 3)
         T = torch.randn(N, C, 3, 3)
@@ -324,14 +330,16 @@ class TestGaussianDensityHead:
         n_gauss = torch.full((N,), 6, dtype=torch.long)
 
         weights, _, _, _ = head(S, V, T, positions, n_gauss)
-        # With tanh, we should see both positive and negative weights
-        # (after segment_softmax of tanh values)
-        has_negative = torch.any(weights < 0).item()
-        has_positive = torch.any(weights > 0).item()
-        # At least positive should exist (softmax of tanh can still be all positive
-        # if tanh outputs are all positive). But the MLP with random weights should
-        # produce some negative tanh outputs.
-        assert has_positive
+        # Range
+        assert torch.all(weights > -1.0) and torch.all(weights < 1.0)
+        # Sign is preserved from raw MLP output (NOT clipped to non-negative
+        # like a softmax/relu would do).
+        s_flat = S.reshape(-1)
+        n_per = n_gauss[0].item()
+        # First atom's first n_per channels go to weights[0:n_per]; pull raw
+        # MLP value to assert sign-preservation under tanh.
+        raw = head.weight_mlp(s_flat[:n_per].unsqueeze(-1)).squeeze(-1)
+        assert torch.allclose(weights[:n_per], torch.tanh(raw), atol=1e-6)
 
     def test_gradient_flow(self, head):
         """Gradients flow through the full head."""

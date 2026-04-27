@@ -8,12 +8,16 @@ Gaussians, indexed by channels c = 0 .. n_gauss(a)-1 of the (S, V, T) tensors.
 Parameter construction (ELECTRAFY Eqs. 13-15)
 ---------------------------------------------
 Weights  w_j = tanh(MLP(S_{i,c}))
-              then softmax-normalized per atom so integral = n_electrons_atom
+              Sign-stable per Eq 13. No per-atom softmax: total-charge
+              consistency is enforced downstream by the IFFT-side
+              electron-count renormalization (Eq 11).
 
 Centers  mu_j = R_atom + V_{i,c}   (direct vector displacement from atom)
 
-Covariance  Sigma_j = gamma * T_{i,c} @ T_{i,c}^T + eps * I
-            (Gram factorization ensures positive definiteness)
+Covariance  Sigma_j = gamma_j * T_{i,c} @ T_{i,c}^T + eps * I
+            with gamma_j = gamma_prior * softplus(MLP(S_{i,c})), per-Gaussian
+            (ELECTRAFY Eq 15). The MLP last layer is initialized so that
+            softplus(output) ≈ 1 at start, i.e. gamma_j ≈ gamma_prior.
 """
 
 from typing import Tuple
@@ -27,7 +31,8 @@ class GaussianDensityHead(nn.Module):
     Converts per-atom (S, V, T) features into Gaussian mixture parameters.
 
     :param n_channels: C = M * max_zval; total feature channels per atom.
-    :param gamma: Global scale factor for covariance matrices (Angstrom^2).
+    :param gamma: Prior scale factor for covariance matrices (Angstrom^2).
+        At init, per-Gaussian gamma_j ≈ this value; the MLP can then deviate.
     :param eps_cov: Small diagonal term added to each covariance for stability.
     """
 
@@ -42,12 +47,25 @@ class GaussianDensityHead(nn.Module):
         self.gamma = gamma
         self.eps_cov = eps_cov
 
-        # Weight MLP: scalar channel -> raw weight logit
+        # Weight MLP: scalar channel -> raw weight logit (Eq 13).
         self.weight_mlp = nn.Sequential(
             nn.Linear(1, 16),
             nn.SiLU(),
             nn.Linear(16, 1),
         )
+
+        # Per-Gaussian gamma MLP: scalar S^(j) -> raw scale (Eq 15).
+        # gamma_j = gamma_prior * softplus(raw); init so softplus(raw) ≈ 1.
+        self.gamma_mlp = nn.Sequential(
+            nn.Linear(1, 16),
+            nn.SiLU(),
+            nn.Linear(16, 1),
+        )
+        with torch.no_grad():
+            last = self.gamma_mlp[-1]
+            last.weight.zero_()
+            # softplus^{-1}(1) = ln(e - 1) ≈ 0.5413
+            last.bias.fill_(0.5413248546129181)
 
     def forward(
         self,
@@ -67,8 +85,9 @@ class GaussianDensityHead(nn.Module):
         :param n_gaussians_per_atom: (N_atoms,) integer tensor; number of
             Gaussians assigned to each atom (= M * Z_val(a)).
         :return: Tuple (weights, centers, covs, atom_idx):
-            - weights: (N_gauss,) real weights (tanh-scaled, segment-softmax
-              normalized per atom).
+            - weights: (N_gauss,) signed real weights w = tanh(MLP(S)) per
+              Eq 13. Total charge is fixed by IFFT-side renormalization, not
+              by a per-atom softmax.
             - centers: (N_gauss, 3) Gaussian centers in Angstrom.
             - covs:    (N_gauss, 3, 3) positive-definite covariance matrices.
             - atom_idx: (N_gauss,) index of the parent atom for each Gaussian.
@@ -111,21 +130,24 @@ class GaussianDensityHead(nn.Module):
         t_flat = T[atom_idx, channel_idx, :, :]     # (N_gauss, 3, 3)
         pos_flat = positions[atom_idx]              # (N_gauss, 3)
 
-        # ---- Weights ----
-        # tanh allows negative contributions (ELECTRAFY Eq. 13),
-        # then segment-softmax normalizes magnitudes per atom.
+        # ---- Weights (ELECTRAFY Eq. 13) ----
+        # w_j = tanh(MLP(S_{i,c})) — signed, sign-stable. Per-atom or
+        # per-system sum is NOT constrained here; total charge is set by
+        # IFFT-side renormalization (Eq 11) in periodic_density_from_gaussians.
         w_raw = self.weight_mlp(s_flat.unsqueeze(-1)).squeeze(-1)  # (N_gauss,)
-        w_raw = torch.tanh(w_raw)
-        weights = _segment_softmax(w_raw, atom_idx, N)  # (N_gauss,)
+        weights = torch.tanh(w_raw)  # (N_gauss,)
 
         # ---- Centers ----
         centers = pos_flat + v_flat  # (N_gauss, 3)
 
-        # ---- Covariances ----
-        # Gram factorization: Sigma = gamma * T @ T^T + eps * I
+        # ---- Covariances (ELECTRAFY Eq 15) ----
+        # Sigma_j = gamma_j * T_j T_j^T + eps * I
+        # gamma_j = gamma_prior * softplus(MLP(S_j))   — per-Gaussian, positive
         TT = torch.bmm(t_flat, t_flat.transpose(-1, -2))  # (N_gauss, 3, 3)
+        gamma_raw = self.gamma_mlp(s_flat.unsqueeze(-1)).squeeze(-1)  # (N_gauss,)
+        gamma_j = self.gamma * torch.nn.functional.softplus(gamma_raw)  # (N_gauss,)
         I3 = torch.eye(3, device=device, dtype=dtype)
-        covs = self.gamma * TT + self.eps_cov * I3[None, :, :]  # (N_gauss, 3, 3)
+        covs = gamma_j[:, None, None] * TT + self.eps_cov * I3[None, :, :]
 
         return weights, centers, covs, atom_idx
 

@@ -278,3 +278,48 @@ def load_chgcar_per_sample(
         systems.append(sys_)
         tmaps.append(density_to_single_sample_tmap(flat, sample_index=i, device=device))
     return systems, tmaps
+
+
+def chgcar_to_system_and_density_native(
+    path: PathLike,
+    *,
+    dtype: torch.dtype = torch.float64,
+) -> Tuple[System, torch.Tensor, Tuple[int, int, int]]:
+    """
+    Read a CHGCAR and return the density on its **native** grid (no resampling).
+
+    Matches the ELECTRAFI paper's data handling for periodic benchmarks
+    (Appendix C): per-structure NGXF/NGYF/NGZF are parsed from the CHGCAR and
+    used directly rather than resampled to a uniform grid.
+
+    :return: ``(system, density_flat, grid_shape)`` where ``density_flat`` has
+        shape ``(N1*N2*N3,)`` flattened in C order matching the ``(N1, N2, N3)``
+        layout used by :func:`read_chgcar`, and ``grid_shape == (N1, N2, N3)``.
+    """
+    atoms, density = read_chgcar(path)
+    grid_shape = (int(density.shape[0]), int(density.shape[1]), int(density.shape[2]))
+    system = systems_to_torch([atoms], dtype=dtype)[0]
+    flat = torch.from_numpy(density.astype(np.float64)).reshape(-1).to(dtype)
+    return system, flat, grid_shape
+
+
+def load_chgcar_native(
+    paths: Sequence[PathLike],
+    *,
+    dtype: torch.dtype = torch.float64,
+) -> Tuple[List[System], List[torch.Tensor], List[Tuple[int, int, int]]]:
+    """
+    Load a list of CHGCARs keeping each density on its native grid.
+
+    :return: ``(systems, flat_densities, grid_shapes)`` — parallel lists where
+        ``flat_densities[i].numel() == prod(grid_shapes[i])``.
+    """
+    systems: List[System] = []
+    flats: List[torch.Tensor] = []
+    shapes: List[Tuple[int, int, int]] = []
+    for p in paths:
+        sys_, flat, shape = chgcar_to_system_and_density_native(p, dtype=dtype)
+        systems.append(sys_)
+        flats.append(flat)
+        shapes.append(shape)
+    return systems, flats, shapes
