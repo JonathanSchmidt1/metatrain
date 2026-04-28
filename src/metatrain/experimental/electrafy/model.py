@@ -38,6 +38,7 @@ References
   arXiv:2305.19302
 """
 
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -182,6 +183,31 @@ class ELECTRAFY(ModelInterface[ModelHypers]):
 
         # -- Valence lookup: atomic_number -> ZVAL --
         self.register_buffer("zval_lookup", ZVAL_LOOKUP.clone())
+
+        # -- Optional surgical compile of the GNN backbone --
+        # Each ``CartesianTransformer`` is pure-tensor and shape-stable except
+        # for the (n_atoms, n_edges) dynamic dimensions — `dynamic=True` keeps
+        # those fluid and emits one shared graph per layer. Together with the
+        # `_fourier_chunk_body` compile in modules/fourier_density.py this
+        # covers the two heaviest blocks of the forward without exposing the
+        # Python-int specializations elsewhere.
+        #
+        # Set ELECTRAFI_COMPILE_GNN=0 to disable (debugging / eager comparison).
+        # Set ELECTRAFI_REPLACE_SILU=1 to also apply PET's
+        # `replace_silu_modules` helper (some versions of inductor compile
+        # PET's SiLU more cleanly after this swap).
+        if os.environ.get("ELECTRAFI_REPLACE_SILU", "0") != "0":
+            try:
+                from metatrain.pet.modules.utilities import replace_silu_modules
+                for layer in self.gnn_layers:
+                    replace_silu_modules(layer)
+            except (ImportError, AttributeError):
+                pass  # PET helper not available; skip silently
+        if os.environ.get("ELECTRAFI_COMPILE_GNN", "0") != "0":
+            for i in range(len(self.gnn_layers)):
+                self.gnn_layers[i] = torch.compile(  # type: ignore[assignment]
+                    self.gnn_layers[i], dynamic=True
+                )
 
         # -- Neighbor list request --
         self.requested_nl = NeighborListOptions(
