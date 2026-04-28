@@ -5,7 +5,11 @@ Key differences from PET trainer:
 - No additive (composition) models or scalers — density has no simple baseline.
 - No energy/force/stress wrapping — output is a per-structure density grid.
 - Uses NMAE loss by default (paper convention).
-- No torch.compile path (density pipeline not yet compile-friendly).
+- Native NGXF/NGYF/NGZF grids per structure: each batch carries a
+  ``grid_shape`` extra-data TensorMap which the trainer reads to call
+  ``model.set_override_grid_shapes`` before every forward.
+- Optional ``torch.compile(dynamic=True)`` wrap (kuma T4/T6/T7 confirmed it
+  works with the gradient-checkpointed Fourier loop).
 - No fine-tuning support (experimental).
 """
 
@@ -17,6 +21,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Union
 
 import torch
+import torch._dynamo
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
@@ -48,6 +53,61 @@ from metatrain.utils.transfer import batch_to
 
 from .documentation import TrainerHypers
 from .model import ELECTRAFY
+from .modules.cache_dataset import decode_grid_shapes
+
+
+# Allow Tensor.item() inside compiled regions (PET nef.py uses it for reverse
+# neighbor index sizing). Without this, torch.compile produces noisy
+# graph-break warnings each forward — same setting the standalone kuma
+# train_mp_*.py scripts use.
+torch._dynamo.config.capture_scalar_outputs = True
+
+
+def _unwrap_to_electrafy(model: torch.nn.Module) -> ELECTRAFY:
+    """Strip ``torch.compile`` and ``DistributedDataParallel`` wrappers to get
+    the underlying :class:`ELECTRAFY` instance — needed to call
+    ``set_override_grid_shapes`` per batch (the API lives on the model, not
+    on the wrappers).
+
+    Order matches the wrap order: training wraps DDP first, then compile.
+    Unwrapping reverses: compile (``_orig_mod``) outermost, then DDP
+    (``module``).
+    """
+    inner: torch.nn.Module = model
+    if hasattr(inner, "_orig_mod"):  # torch.compile
+        inner = inner._orig_mod
+    if hasattr(inner, "module"):  # DDP
+        inner = inner.module
+    if not isinstance(inner, ELECTRAFY):
+        raise TypeError(
+            f"expected ELECTRAFY after unwrapping; got {type(inner).__name__}"
+        )
+    return inner
+
+
+def _apply_grid_shapes(
+    inner: ELECTRAFY,
+    extra_data: Optional[Dict[str, Any]],
+    n_systems: int,
+) -> bool:
+    """Read per-system grid shapes from ``extra_data['grid_shape']`` and call
+    ``inner.set_override_grid_shapes(...)``. Returns ``True`` if shapes were
+    applied (caller is responsible for ``clear_override_grid_shapes`` in a
+    ``finally`` block).
+
+    No-op if the batch has no ``grid_shape`` extra (backwards-compatible with
+    older datasets that pin a single grid via ``model.grid_shape``).
+    """
+    if extra_data is None or "grid_shape" not in extra_data:
+        return False
+    shapes = decode_grid_shapes(extra_data["grid_shape"])
+    if len(shapes) != n_systems:
+        raise RuntimeError(
+            f"grid_shape extra has {len(shapes)} entries but batch has "
+            f"{n_systems} systems"
+        )
+    inner.set_override_grid_shapes(shapes)
+    return True
 
 
 def _get_scheduler(
@@ -209,6 +269,13 @@ class Trainer(TrainerInterface[TrainerHypers]):
         if is_distributed:
             model = DistributedDataParallel(model, device_ids=[device])
 
+        # Optional torch.compile wrap. Dynamic shapes because each batch has
+        # its own native (N1, N2, N3). Validated end-to-end by kuma jobs
+        # 2865154 / 3104195 / 3108060 (T4 / T6 / T7).
+        if self.hypers.get("compile", False):
+            logging.info("compiling model with torch.compile(dynamic=True)")
+            model = torch.compile(model, dynamic=True)
+
         # Loss function
         loss_hypers = dict(self.hypers.get("loss", {"type": "nmae", "weight": 1.0}))
         loss_fn = LossAggregator(
@@ -278,13 +345,21 @@ class Trainer(TrainerInterface[TrainerHypers]):
                     systems, targets, extra_data, dtype=dtype, device=device
                 )
 
-                # Forward pass: model produces density TensorMaps
-                predictions = evaluate_model(
-                    model,
-                    systems,
-                    {key: train_targets[key] for key in targets.keys()},
-                    is_training=True,
-                )
+                # Per-batch native grid shape (paper Appendix C). Reset after
+                # forward so a stale override can't leak into the next batch.
+                inner_model = _unwrap_to_electrafy(model)
+                applied = _apply_grid_shapes(inner_model, extra_data, len(systems))
+                try:
+                    # Forward pass: model produces density TensorMaps
+                    predictions = evaluate_model(
+                        model,
+                        systems,
+                        {key: train_targets[key] for key in targets.keys()},
+                        is_training=True,
+                    )
+                finally:
+                    if applied:
+                        inner_model.clear_override_grid_shapes()
 
                 train_loss_batch = loss_fn(predictions, targets, extra_data)
 
@@ -343,11 +418,19 @@ class Trainer(TrainerInterface[TrainerHypers]):
                                 systems_v, targets_v, extra_data_v,
                                 dtype=dtype, device=device,
                             )
-                            predictions_v = evaluate_model(
-                                model, systems_v,
-                                {key: train_targets[key] for key in targets_v},
-                                is_training=False,
+                            inner_model_v = _unwrap_to_electrafy(model)
+                            applied_v = _apply_grid_shapes(
+                                inner_model_v, extra_data_v, len(systems_v)
                             )
+                            try:
+                                predictions_v = evaluate_model(
+                                    model, systems_v,
+                                    {key: train_targets[key] for key in targets_v},
+                                    is_training=False,
+                                )
+                            finally:
+                                if applied_v:
+                                    inner_model_v.clear_override_grid_shapes()
                             val_loss_batch = loss_fn(
                                 predictions_v, targets_v, extra_data_v
                             )

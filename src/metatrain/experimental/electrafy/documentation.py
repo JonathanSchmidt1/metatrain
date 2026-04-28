@@ -119,6 +119,21 @@ class TrainerHypers(TypedDict):
     checkpoint_interval: float = 10.0
     """Checkpoint-saving interval in epochs."""
 
+    grad_clip_norm: float = 10.0
+    """Max global gradient norm. Tighter values (e.g. 1.0) stabilize early
+    training; T7 used 1.0 with 5%% warmup vs T4's 10.0 with 1%%."""
+
+    num_workers: Optional[int] = None
+    """DataLoader workers per rank. ``None`` auto-detects via
+    ``get_num_workers()`` (≈ ``min(cpu_count - 4, 8)``)."""
+
+    compile: bool = False
+    """If true, wrap the model in ``torch.compile(dynamic=True)`` after the
+    DDP wrap. Validated by kuma jobs T4/T6/T7."""
+
+    best_model_metric: str = "loss"
+    """Metric key to track for best-model selection (validation side)."""
+
     loss: LossSpecification = {
         "type": "nmae",
         "weight": 1.0,
