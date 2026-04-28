@@ -21,6 +21,7 @@ number of valence electrons.
 """
 
 import math
+import os
 from typing import Tuple
 
 import torch
@@ -110,6 +111,34 @@ def _fourier_chunk_body(
     )
 
 
+# Surgical torch.compile of the Fourier chunk body.
+#
+# This is the smallest closed graph in the model that contains zero
+# Python-int specialization (no `.item()`, no Python branches on tensor
+# values, no shape-derived ints) — ideal for compile under dynamic=True.
+# Inputs are (weights, centers, covs, G_chunk); shapes vary as
+# `(N_gauss,)`, `(N_gauss, 3)`, `(N_gauss, 3, 3)`, `(chunk, 3)`. Dynamo
+# emits a single dynamic-shape graph that handles every batch.
+#
+# Bench-historical: full-model compile (kuma 3170683 / 3171246 / 3172376)
+# hung on the model's forward because of `int(n_gaussians_per_atom.sum().item())`
+# in gaussian_density.py and `(N1, N2, N3)` Python tuples in model.py.
+# Compiling INSIDE those Python boundaries — only the chunk body — keeps
+# all those specializations out of the compiled graph.
+#
+# The two-step quadratic form ABOVE (SigmaG → elementwise → reduce, NOT a
+# fused `gd, jde, ge -> gj` einsum) is intentionally preserved; T5 (kuma
+# 2865159) showed the fused form drops covs.grad under
+# compile + checkpoint(use_reentrant=False).
+#
+# Set ELECTRAFI_COMPILE_FOURIER=0 to disable (debugging / eager comparison).
+_COMPILE_FOURIER = os.environ.get("ELECTRAFI_COMPILE_FOURIER", "1") != "0"
+if _COMPILE_FOURIER:
+    _fourier_chunk_body_call = torch.compile(_fourier_chunk_body, dynamic=True)
+else:
+    _fourier_chunk_body_call = _fourier_chunk_body
+
+
 def gaussian_fourier_coefficients(
     weights: torch.Tensor,
     centers: torch.Tensor,
@@ -152,11 +181,11 @@ def gaussian_fourier_coefficients(
         G_chunk = G_flat[start:end]  # (chunk, 3)
         if use_ckpt:
             out = torch.utils.checkpoint.checkpoint(
-                _fourier_chunk_body, weights, centers, covs, G_chunk,
+                _fourier_chunk_body_call, weights, centers, covs, G_chunk,
                 use_reentrant=False,
             )
         else:
-            out = _fourier_chunk_body(weights, centers, covs, G_chunk)
+            out = _fourier_chunk_body_call(weights, centers, covs, G_chunk)
         chunks.append(out)
 
     return torch.cat(chunks, dim=0)
