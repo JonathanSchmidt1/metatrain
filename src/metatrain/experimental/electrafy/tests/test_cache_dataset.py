@@ -171,6 +171,23 @@ class TestScanAtomicTypes:
 
 
 class TestCollateRoundtrip:
+    def test_collate_rejects_fp32_dataset(self, cache_dir):
+        """metatomic's buffer serializer only supports fp64. Confirm we get
+        a clear error if someone passes fp32 to the dataset and then tries to
+        run it through metatrain's CollateFn — caught the bug behind kuma
+        bench job 3170038."""
+        ds = CachedChgcarDataset(_list_cache(cache_dir), dtype=torch.float32)
+        nl_opts = NeighborListOptions(cutoff=4.0, full_list=True, strict=True)
+        collate = CollateFn(
+            target_keys=["charge_density"],
+            callables=[get_system_with_neighbor_lists_transform([nl_opts])],
+        )
+        loader = DataLoader(
+            ds, batch_size=1, shuffle=False, num_workers=0, collate_fn=collate
+        )
+        with pytest.raises(ValueError, match="float64"):
+            next(iter(loader))
+
     def test_collate_extra_data_grid_shape(self, cache_dir):
         """The full path:
         Dataset → DataLoader(collate_fn=CollateFn(...)) → unpack_batch → decode.

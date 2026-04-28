@@ -124,9 +124,13 @@ class CachedChgcarDataset(torch.utils.data.Dataset):
         back to when a cache file is missing (or fails to load). Useful while
         the cache build trails the live download. Set to ``None`` (default) to
         raise on cache misses.
-    :param dtype: Tensor dtype for the reconstructed System and density. The
-        trainer typically runs in fp32 but ``cell`` accuracy benefits from
-        keeping cache records in fp64; the dtype cast happens here.
+    :param dtype: Tensor dtype for the reconstructed System and density.
+        **Keep this at ``torch.float64``** when this dataset is used with
+        metatrain's standard ``CollateFn`` — the buffer serializer
+        (``metatomic.torch.serialization.save_buffer``) only supports fp64
+        and raises ``ValueError: cannot save TensorBlock with dtype
+        torch.float32, only float64 is supported`` otherwise. The actual
+        training dtype is applied later via ``batch_to`` inside the trainer.
     """
 
     SAMPLE_FIELDS = ("system", "charge_density", "grid_shape")
