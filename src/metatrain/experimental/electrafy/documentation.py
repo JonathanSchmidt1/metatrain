@@ -83,6 +83,16 @@ class ModelHypers(TypedDict):
     """Number of G-vectors processed per chunk in the analytic Fourier transform.
     Reduce to save GPU memory at the cost of speed."""
 
+    head_mlp_hidden: int = 64
+    """Hidden width of the per-Gaussian weight and gamma MLPs in the
+    GaussianDensityHead (paper Eq 13/15: f_w, f_gamma)."""
+
+    dyadic_mlp_hidden: int = 0
+    """Hidden width of the per-channel scalar/kappa/m MLPs in the dyadic
+    aggregation layer (paper Eq 19/22/24, MLPs g_c, phi_m, g_tilde). When 0,
+    falls back to a single linear projection (legacy pre-audit behaviour);
+    set to e.g. d_node//2 to use a 2-layer MLP."""
+
 
 class TrainerHypers(TypedDict):
     """Hyperparameters for training ELECTRAFY models."""

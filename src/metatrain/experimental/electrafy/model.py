@@ -154,12 +154,14 @@ class ELECTRAFY(ModelInterface[ModelHypers]):
             d_node=self.d_node,
             d_edge=self.d_pet,
             n_channels=self.n_channels,
+            mlp_hidden=hypers.get("dyadic_mlp_hidden", 0),
         )
 
         # -- Gaussian density head --
         self.gaussian_head = GaussianDensityHead(
             n_channels=self.n_channels,
             gamma=hypers["gamma"],
+            mlp_hidden=hypers.get("head_mlp_hidden", 64),
         )
 
         # -- Species lookup: atomic_number -> (Z, v) embedding index --
@@ -238,12 +240,33 @@ class ELECTRAFY(ModelInterface[ModelHypers]):
         # :meth:`clear_override_grid_shapes`.
         self._override_grid_shapes: Optional[List[Tuple[int, int, int]]] = None
 
+        # Per-batch electron-count override. When set, ``forward`` uses these
+        # values (one per system, in batch order) for the Eq-11 electron-count
+        # normalization instead of the canonical ``ZVAL_LOOKUP`` sum. This is
+        # the right thing to use for CHGCARs computed with non-canonical
+        # pseudopotentials (e.g. Fe_pv vs Fe), and is also more numerically
+        # robust because the CHGCAR-integrated electron count is exact
+        # rather than reconstructed from an element->valence table.
+        self._override_n_electrons: Optional[List[float]] = None
+
     def set_override_grid_shapes(self, shapes: List[Tuple[int, int, int]]) -> None:
         """Set per-system output grid shapes for the next forward call."""
         self._override_grid_shapes = [tuple(s) for s in shapes]  # type: ignore[assignment]
 
     def clear_override_grid_shapes(self) -> None:
         self._override_grid_shapes = None
+
+    def set_override_n_electrons(self, n_electrons: List[float]) -> None:
+        """Set per-system electron counts for the next forward call.
+
+        :param n_electrons: One float per system in the batch — the integrated
+            valence electron count for that structure (typically
+            ``∫ρ_ref dV``). Used for Eq-11 normalization.
+        """
+        self._override_n_electrons = [float(n) for n in n_electrons]
+
+    def clear_override_n_electrons(self) -> None:
+        self._override_n_electrons = None
 
     # ------------------------------------------------------------------
     # ModelInterface API
@@ -345,6 +368,14 @@ class ELECTRAFY(ModelInterface[ModelHypers]):
         else:
             per_system_shapes = [self.grid_shape] * n_systems
 
+        if self._override_n_electrons is not None and len(
+            self._override_n_electrons
+        ) != n_systems:
+            raise ValueError(
+                f"override n_electrons ({len(self._override_n_electrons)}) "
+                f"!= n_systems ({n_systems})"
+            )
+
         density_rows: List[torch.Tensor] = []
         atom_offset = 0
         for sys_idx, system in enumerate(systems):
@@ -357,9 +388,13 @@ class ELECTRAFY(ModelInterface[ModelHypers]):
                 n_gaussians_per_atom[atom_slice],
             )
 
-            n_elec = float(
-                (n_gaussians_per_atom[atom_slice].sum() / self.gaussians_per_electron).item()
-            )
+            if self._override_n_electrons is not None:
+                n_elec = self._override_n_electrons[sys_idx]
+            else:
+                n_elec = float(
+                    (n_gaussians_per_atom[atom_slice].sum()
+                     / self.gaussians_per_electron).item()
+                )
 
             rho = periodic_density_from_gaussians(
                 weights=weights,

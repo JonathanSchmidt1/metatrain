@@ -44,6 +44,22 @@ import torch
 import torch.nn as nn
 
 
+def _mlp_or_linear(in_dim: int, out_dim: int, hidden: int) -> nn.Module:
+    """Build a 2-layer MLP if ``hidden > 0``, else a single Linear.
+
+    Paper Eq 19 / 22 / 24 specify these as MLPs (g_c, phi_m, g_tilde); the
+    legacy pre-audit implementation used Linear, so ``hidden = 0`` recovers
+    that.
+    """
+    if hidden <= 0:
+        return nn.Linear(in_dim, out_dim)
+    return nn.Sequential(
+        nn.Linear(in_dim, hidden),
+        nn.SiLU(),
+        nn.Linear(hidden, out_dim),
+    )
+
+
 class DyadicAggregationLayer(nn.Module):
     """
     Single-layer dyadic aggregation: maps PET node/edge features -> (S, V, T).
@@ -52,6 +68,9 @@ class DyadicAggregationLayer(nn.Module):
     :param d_edge: Dimension of PET edge embeddings.
     :param n_channels: Number of output channels C (= M * max_zval).
     :param eps: Small constant for numerical stability in vector normalization.
+    :param mlp_hidden: Hidden width for the per-channel scalar / kappa / m
+        MLPs. ``0`` recovers a single linear projection (legacy behaviour);
+        the paper specifies these as MLPs (Eq 19, 22, 24).
     """
 
     def __init__(
@@ -60,25 +79,28 @@ class DyadicAggregationLayer(nn.Module):
         d_edge: int,
         n_channels: int,
         eps: float = 1e-8,
+        mlp_hidden: int = 0,
     ) -> None:
         super().__init__()
         self.n_channels = n_channels
         self.eps = eps
 
-        # Scalar branch (Eq 19)
-        self.scalar_proj = nn.Linear(d_node, n_channels)
+        # Scalar branch (Eq 19): S_{i,c} = g_c(h_i), g_c is an MLP per paper.
+        self.scalar_proj = _mlp_or_linear(d_node, n_channels, mlp_hidden)
 
         # Vector branch (Eqs 20-22): own carrier-vector construction
         self.vec_carrier_proj = nn.Linear(d_edge, 3)        # d̄^v
         self.vec_gate_proj = nn.Linear(d_edge, 1)           # a^v (pre-sigmoid)
         self.vec_attn_proj = nn.Linear(d_edge, n_channels)  # alpha logits
-        self.vec_mag_proj = nn.Linear(d_node, n_channels)   # m (pre-softplus)
+        # m_{i,c} = phi_m(h_i), phi_m is an MLP per paper Eq 22.
+        self.vec_mag_proj = _mlp_or_linear(d_node, n_channels, mlp_hidden)
 
         # Tensor branch (Eqs 23-24): SEPARATE carrier-vector construction
         self.tens_carrier_proj = nn.Linear(d_edge, 3)        # d̄^t
         self.tens_gate_proj = nn.Linear(d_edge, 1)           # a^t (pre-sigmoid)
         self.tens_attn_proj = nn.Linear(d_edge, n_channels)  # beta logits
-        self.tens_iso_proj = nn.Linear(d_node, n_channels)   # kappa (trace)
+        # kappa_{i,c} = g_tilde(h_i), g_tilde is an MLP per paper Eq 24.
+        self.tens_iso_proj = _mlp_or_linear(d_node, n_channels, mlp_hidden)
 
         # Cross-layer logits (used by DyadicAggregation to softmax over layers)
         self.layer_logit_proj = nn.Linear(d_node, n_channels)
@@ -202,11 +224,14 @@ class DyadicAggregation(nn.Module):
         d_edge: int,
         n_channels: int,
         eps: float = 1e-8,
+        mlp_hidden: int = 0,
     ) -> None:
         super().__init__()
         self.layers = nn.ModuleList(
             [
-                DyadicAggregationLayer(d_node, d_edge, n_channels, eps)
+                DyadicAggregationLayer(
+                    d_node, d_edge, n_channels, eps, mlp_hidden=mlp_hidden
+                )
                 for _ in range(n_gnn_layers)
             ]
         )

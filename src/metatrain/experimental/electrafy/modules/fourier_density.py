@@ -254,13 +254,15 @@ def periodic_density_from_gaussians(
     V = torch.abs(torch.linalg.det(cell))
     rho = rho / V
 
-    # Normalize to correct electron count.
-    # integral rho dV ≈ sum_n rho(r_n) * (V / N_total)
+    # Normalize to correct electron count (paper Eq 11: rescale all weights
+    # by a single POSITIVE factor so ∫ρ dr = N_e). We rescale ρ post-IFFT,
+    # which is mathematically equivalent. The factor must be positive to
+    # avoid sign-flipping ρ everywhere when ∫ρ < 0 (common at init, since
+    # tanh weights are random near zero). We take the absolute value of the
+    # integral with a small floor to keep gradients defined.
     integral = rho.sum() * (V / N_total)
-    # Clamp the ratio to prevent explosion when integral is near-zero
-    # (common early in training when weights are small).
-    ratio = n_electrons / (integral + 1e-8 * torch.sign(integral + 1e-30))
-    ratio = torch.clamp(ratio, min=-1e4, max=1e4)
+    ratio = n_electrons / torch.clamp(integral.abs(), min=1e-8)
+    ratio = torch.clamp(ratio, max=1e4)
     rho = rho * ratio
 
     return rho

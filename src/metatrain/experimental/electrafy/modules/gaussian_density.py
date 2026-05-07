@@ -34,6 +34,9 @@ class GaussianDensityHead(nn.Module):
     :param gamma: Prior scale factor for covariance matrices (Angstrom^2).
         At init, per-Gaussian gamma_j ≈ this value; the MLP can then deviate.
     :param eps_cov: Small diagonal term added to each covariance for stability.
+    :param mlp_hidden: Hidden width of the per-Gaussian weight and gamma MLPs.
+        Paper notation has S^(j) ∈ ℝ so f_w / f_γ are scalar→scalar; we keep
+        a 2-layer MLP with this hidden width.
     """
 
     def __init__(
@@ -41,6 +44,7 @@ class GaussianDensityHead(nn.Module):
         n_channels: int,
         gamma: float = 0.1,
         eps_cov: float = 1e-6,
+        mlp_hidden: int = 64,
     ) -> None:
         super().__init__()
         self.n_channels = n_channels
@@ -49,17 +53,21 @@ class GaussianDensityHead(nn.Module):
 
         # Weight MLP: scalar channel -> raw weight logit (Eq 13).
         self.weight_mlp = nn.Sequential(
-            nn.Linear(1, 16),
+            nn.Linear(1, mlp_hidden),
             nn.SiLU(),
-            nn.Linear(16, 1),
+            nn.Linear(mlp_hidden, mlp_hidden),
+            nn.SiLU(),
+            nn.Linear(mlp_hidden, 1),
         )
 
         # Per-Gaussian gamma MLP: scalar S^(j) -> raw scale (Eq 15).
         # gamma_j = gamma_prior * softplus(raw); init so softplus(raw) ≈ 1.
         self.gamma_mlp = nn.Sequential(
-            nn.Linear(1, 16),
+            nn.Linear(1, mlp_hidden),
             nn.SiLU(),
-            nn.Linear(16, 1),
+            nn.Linear(mlp_hidden, mlp_hidden),
+            nn.SiLU(),
+            nn.Linear(mlp_hidden, 1),
         )
         with torch.no_grad():
             last = self.gamma_mlp[-1]
