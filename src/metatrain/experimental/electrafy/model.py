@@ -250,6 +250,11 @@ class ELECTRAFY(ModelInterface[ModelHypers]):
         # rather than reconstructed from an element->valence table.
         self._override_n_electrons: Optional[List[float]] = None
 
+        # Populated at the end of each forward; (n_systems+1,) prefix-sum offsets
+        # into the flat density tensor so micro-batched callers can slice the
+        # per-system density when grids vary.
+        self._last_density_offsets: Optional[torch.Tensor] = None
+
     def set_override_grid_shapes(self, shapes: List[Tuple[int, int, int]]) -> None:
         """Set per-system output grid shapes for the next forward call."""
         self._override_grid_shapes = [tuple(s) for s in shapes]  # type: ignore[assignment]
@@ -409,20 +414,31 @@ class ELECTRAFY(ModelInterface[ModelHypers]):
             )
             density_rows.append(rho.reshape(-1))
 
-        # Stacking requires all rows to share the same length. With
-        # variable native grids this holds only for batch_size=1, which is
-        # what the paper uses (real_batch_size: 1). If multiple systems in a
-        # batch happen to share the same grid, stacking still works.
-        grid_sizes = {row.numel() for row in density_rows}
-        if len(grid_sizes) != 1:
-            raise RuntimeError(
-                f"variable native grids in one batch: {grid_sizes}. Use "
-                f"batch_size=1 when training on native CHGCAR grids."
+        # Variable-grid handling: when all systems in this batch share the
+        # same grid we keep the legacy (n_systems, grid_size) stacked layout
+        # — back-compat with batch=1 callers that read
+        # `out.block().values.reshape(-1)`. When grids differ, we concatenate
+        # into a flat (sum_grid_sizes,) tensor and stash per-system offsets
+        # on `self._last_density_offsets` so micro-batched callers can slice
+        # densities per system. The TensorMap surface stays a single block.
+        sizes = [row.numel() for row in density_rows]
+        unique_sizes = set(sizes)
+        if len(unique_sizes) == 1:
+            density_values = torch.stack(density_rows, dim=0)
+            self._last_density_offsets = torch.arange(
+                0, n_systems * sizes[0] + 1, sizes[0],
+                device=device, dtype=torch.long,
             )
-        density_values = torch.stack(density_rows, dim=0)
+        else:
+            flat = torch.cat(density_rows, dim=0)
+            density_values = flat.unsqueeze(0)  # (1, sum_grid_sizes)
+            offsets = torch.zeros(n_systems + 1, device=device, dtype=torch.long)
+            for i, s in enumerate(sizes):
+                offsets[i + 1] = offsets[i] + s
+            self._last_density_offsets = offsets
 
         # ---- Wrap in TensorMap ----
-        tmap = self._wrap_density_tmap(density_values, n_systems, device)
+        tmap = self._wrap_density_tmap(density_values, density_values.shape[0], device)
         return {DENSITY_KEY: tmap}
 
     # ------------------------------------------------------------------
