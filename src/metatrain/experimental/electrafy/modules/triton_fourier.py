@@ -36,9 +36,21 @@ import torch
 try:
     import triton
     import triton.language as tl
+    # Fast-math intrinsics live in libdevice. Try the modern path first, then
+    # the older nested path. Both expose `fast_expf`, `fast_cosf`, `fast_sinf`.
+    try:
+        from triton.language.extra import libdevice  # type: ignore[attr-defined]
+    except (ImportError, AttributeError):
+        try:
+            from triton.language.extra.cuda import libdevice  # type: ignore[attr-defined]
+        except (ImportError, AttributeError):
+            libdevice = None  # type: ignore[assignment]
     HAVE_TRITON = True
+    HAVE_FAST_MATH = libdevice is not None
 except ImportError:
     HAVE_TRITON = False
+    HAVE_FAST_MATH = False
+    libdevice = None  # type: ignore[assignment]
 
 
 if HAVE_TRITON:
@@ -58,6 +70,7 @@ if HAVE_TRITON:
         J,
         BLOCK_G: tl.constexpr,
         BLOCK_J: tl.constexpr,
+        USE_FAST_MATH: tl.constexpr = False,
     ):
         """One program per j-tile. Inner loop over g-tiles, recomputing fwd."""
         pid_j = tl.program_id(0)
@@ -128,10 +141,15 @@ if HAVE_TRITON:
                 + G1[:, None] * SG1
                 + G2[:, None] * SG2
             )
-            e_exp = tl.exp(exponent)
+            if USE_FAST_MATH:
+                e_exp = libdevice.fast_expf(exponent)
+                cos_p = libdevice.fast_cosf(phase)
+                sin_p = libdevice.fast_sinf(phase)
+            else:
+                e_exp = tl.exp(exponent)
+                cos_p = tl.cos(phase)
+                sin_p = tl.sin(phase)
             amp = w[None, :] * e_exp
-            cos_p = tl.cos(phase)
-            sin_p = tl.sin(phase)
 
             # Pullbacks. out_re = Σ_j amp*cos, out_im = -Σ_j amp*sin.
             # d_amp = grad_re*cos - grad_im*sin
@@ -190,6 +208,7 @@ if HAVE_TRITON:
         J,
         BLOCK_G: tl.constexpr,
         BLOCK_J: tl.constexpr,
+        USE_FAST_MATH: tl.constexpr = False,
     ):
         pid = tl.program_id(0)
         g_off = pid * BLOCK_G + tl.arange(0, BLOCK_G)        # (BLOCK_G,)
@@ -253,9 +272,18 @@ if HAVE_TRITON:
                 + G2[:, None] * SG2
             )
 
-            amp = w[None, :] * tl.exp(exponent)
-            cos_p = tl.cos(phase)
-            sin_p = tl.sin(phase)
+            if USE_FAST_MATH:
+                # NVIDIA SFU fast intrinsics via libdevice. ~10^-6 rel error,
+                # ~3x SFU throughput vs the precise variants. Targets the
+                # per-element transcendental bottleneck (Fourier head is
+                # SFU-bound, not HBM- or FLOP-bound).
+                amp = w[None, :] * libdevice.fast_expf(exponent)
+                cos_p = libdevice.fast_cosf(phase)
+                sin_p = libdevice.fast_sinf(phase)
+            else:
+                amp = w[None, :] * tl.exp(exponent)
+                cos_p = tl.cos(phase)
+                sin_p = tl.sin(phase)
 
             valid = j_mask[None, :] & g_mask[:, None]
             amp = tl.where(valid, amp, 0.0)
@@ -283,7 +311,8 @@ def _check_inputs(weights, centers, covs, G_chunk):
     return G_size, J
 
 
-def _launch_fwd(weights, centers, covs, G_chunk, block_g, block_j):
+def _launch_fwd(weights, centers, covs, G_chunk, block_g, block_j, use_fast_math=False,
+                num_warps=4, num_stages=2):
     G_size, J = _check_inputs(weights, centers, covs, G_chunk)
     out_re = torch.empty(G_size, device=G_chunk.device, dtype=torch.float32)
     out_im = torch.empty(G_size, device=G_chunk.device, dtype=torch.float32)
@@ -292,12 +321,16 @@ def _launch_fwd(weights, centers, covs, G_chunk, block_g, block_j):
         weights, centers, covs, G_chunk,
         out_re, out_im,
         G_size, J,
+        USE_FAST_MATH=use_fast_math,
+        num_warps=num_warps,
+        num_stages=num_stages,
         BLOCK_G=block_g, BLOCK_J=block_j,
     )
     return out_re, out_im
 
 
-def _launch_bwd(weights, centers, covs, G_chunk, grad_re, grad_im, block_g, block_j):
+def _launch_bwd(weights, centers, covs, G_chunk, grad_re, grad_im,
+                block_g, block_j, use_fast_math=False):
     G_size, J = _check_inputs(weights, centers, covs, G_chunk)
     dw = torch.empty(J, device=G_chunk.device, dtype=torch.float32)
     dc = torch.empty(J, 3, device=G_chunk.device, dtype=torch.float32)
@@ -309,23 +342,34 @@ def _launch_bwd(weights, centers, covs, G_chunk, grad_re, grad_im, block_g, bloc
         dw, dc, dK,
         G_size, J,
         BLOCK_G=block_g, BLOCK_J=block_j,
+        USE_FAST_MATH=use_fast_math,
     )
     return dw, dc, dK
 
 
+# Production default: fast-math on. v2 bench (3332951) showed 2.7-2.8x speedup
+# on the fwd kernel at every grid size from 100k-2M with rel diff ~3e-7 (well
+# under fp32 noise). Set ELECTRAFI_TRITON_FAST_MATH=0 to disable for ablations.
+import os as _os
+_FAST_MATH_DEFAULT = bool(HAVE_FAST_MATH and _os.environ.get("ELECTRAFI_TRITON_FAST_MATH", "1") != "0")
+
+
 class _FourierChunkTriton(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, weights, centers, covs, G_chunk, block_g, block_j):
+    def forward(ctx, weights, centers, covs, G_chunk, block_g, block_j, use_fast_math):
         weights = weights.contiguous()
         centers = centers.contiguous()
         covs = covs.contiguous()
         G_chunk = G_chunk.contiguous()
-        out_re, out_im = _launch_fwd(weights, centers, covs, G_chunk, block_g, block_j)
+        out_re, out_im = _launch_fwd(
+            weights, centers, covs, G_chunk, block_g, block_j, use_fast_math
+        )
         # Save inputs for backward (we recompute fwd inside the bwd kernel, so
         # we don't need to save phase/amp/exponent — just the inputs).
         ctx.save_for_backward(weights, centers, covs, G_chunk)
         ctx.block_g = block_g
         ctx.block_j = block_j
+        ctx.use_fast_math = use_fast_math
         return torch.complex(out_re, out_im)
 
     @staticmethod
@@ -337,9 +381,10 @@ class _FourierChunkTriton(torch.autograd.Function):
             weights, centers, covs, G_chunk,
             grad_re, grad_im,
             ctx.block_g, ctx.block_j,
+            ctx.use_fast_math,
         )
-        # Returns one None per non-tensor positional arg (block_g, block_j)
-        return dw, dc, dK, None, None, None
+        # Returns one None per non-tensor positional arg (block_g, block_j, use_fast_math)
+        return dw, dc, dK, None, None, None, None
 
 
 def triton_fourier_chunk(
@@ -349,9 +394,20 @@ def triton_fourier_chunk(
     G_chunk: torch.Tensor,
     block_g: int = 64,
     block_j: int = 64,
+    use_fast_math: bool = None,
 ) -> torch.Tensor:
-    """Fully autograd-aware fused chunk kernel (fwd + bwd). Returns complex (chunk,)."""
-    return _FourierChunkTriton.apply(weights, centers, covs, G_chunk, block_g, block_j)
+    """Fully autograd-aware fused chunk kernel (fwd + bwd). Returns complex (chunk,).
+
+    `use_fast_math=None` (default) follows ``ELECTRAFI_TRITON_FAST_MATH`` env var,
+    which defaults to ON when libdevice is available. v2 bench measured 2.7x
+    fwd speedup with rel|grad| ~ 3e-7 vs the precise variant — safe for fp32
+    training. Set the env var to ``0`` to force precise math for ablations.
+    """
+    if use_fast_math is None:
+        use_fast_math = _FAST_MATH_DEFAULT
+    return _FourierChunkTriton.apply(
+        weights, centers, covs, G_chunk, block_g, block_j, use_fast_math
+    )
 
 
 def triton_fourier_chunk_fwd(
@@ -361,13 +417,19 @@ def triton_fourier_chunk_fwd(
     G_chunk: torch.Tensor,
     block_g: int = 64,
     block_j: int = 64,
+    use_fast_math: bool = False,
+    num_warps: int = 4,
+    num_stages: int = 2,
 ) -> torch.Tensor:
     """Forward-only entry point (no autograd). Useful for inference benches."""
     weights = weights.contiguous()
     centers = centers.contiguous()
     covs = covs.contiguous()
     G_chunk = G_chunk.contiguous()
-    out_re, out_im = _launch_fwd(weights, centers, covs, G_chunk, block_g, block_j)
+    out_re, out_im = _launch_fwd(
+        weights, centers, covs, G_chunk, block_g, block_j,
+        use_fast_math, num_warps=num_warps, num_stages=num_stages,
+    )
     return torch.complex(out_re, out_im)
 
 
