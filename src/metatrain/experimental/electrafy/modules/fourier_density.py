@@ -146,6 +146,7 @@ def gaussian_fourier_coefficients(
     G_flat: torch.Tensor,
     chunk_size: int = 4096,
     checkpoint: bool = True,
+    use_triton: bool = False,
 ) -> torch.Tensor:
     """
     Compute Fourier coefficients rho_hat(G) for a Gaussian mixture.
@@ -169,7 +170,18 @@ def gaussian_fourier_coefficients(
         chunk during backward to bound activation memory. Disabled when no
         input requires grad (eval / no-grad).
     :return: Complex tensor of shape (N_G,).
+
+    When ``use_triton=True``, a single fused Triton kernel call replaces the
+    Python chunk loop (and the ``chunk_size`` / ``checkpoint`` flags become
+    no-ops). The kernel keeps all (G, J) intermediates in registers; bench
+    3332829 measured ~2.8x fwd / ~2.1x fwd+bwd vs the PyTorch loop with
+    ~600x lower peak memory at every grid size from 100k to 2M, with
+    fp32-noise-floor numerical equivalence on grads. Requires CUDA + Triton.
     """
+    if use_triton:
+        from .triton_fourier import triton_fourier_chunk
+        return triton_fourier_chunk(weights, centers, covs, G_flat)
+
     N_G = G_flat.shape[0]
     use_ckpt = checkpoint and (
         weights.requires_grad or centers.requires_grad or covs.requires_grad
@@ -200,6 +212,7 @@ def periodic_density_from_gaussians(
     n_electrons: float,
     chunk_size: int = 4096,
     use_rfft: bool = False,
+    use_triton: bool = False,
 ) -> torch.Tensor:
     """
     Compute the periodic real-space charge density from Gaussian parameters.
@@ -234,7 +247,8 @@ def periodic_density_from_gaussians(
         N3_r = N3 // 2 + 1
         G_flat = G.reshape(-1, 3)  # (N1*N2*N3_r, 3)
         rho_hat_flat = gaussian_fourier_coefficients(
-            weights, centers, covs, G_flat, chunk_size=chunk_size
+            weights, centers, covs, G_flat,
+            chunk_size=chunk_size, use_triton=use_triton
         )
         rho_hat_half = rho_hat_flat.reshape(N1, N2, N3_r)
         # irfftn: complex (N1, N2, N3//2+1) -> real (N1, N2, N3); applies the
@@ -244,7 +258,8 @@ def periodic_density_from_gaussians(
         G = _build_g_vectors(grid_shape, cell, rfft=False)  # (N1, N2, N3, 3)
         G_flat = G.reshape(-1, 3)
         rho_hat_flat = gaussian_fourier_coefficients(
-            weights, centers, covs, G_flat, chunk_size=chunk_size
+            weights, centers, covs, G_flat,
+            chunk_size=chunk_size, use_triton=use_triton
         )
         rho_hat = rho_hat_flat.reshape(N1, N2, N3)
         rho = torch.fft.ifftn(rho_hat).real * (N_total / 1.0)

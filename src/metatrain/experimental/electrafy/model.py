@@ -99,6 +99,7 @@ class ELECTRAFY(ModelInterface[ModelHypers]):
         self.num_gnn_layers = hypers["num_gnn_layers"]
         self.gaussians_per_electron = hypers["gaussians_per_electron"]
         self.fourier_chunk_size = hypers["fourier_chunk_size"]
+        self.use_triton_fourier = bool(hypers.get("use_triton_fourier", False))
         self.grid_shape: Tuple[int, int, int] = tuple(hypers["grid_shape"])  # type: ignore[assignment]
 
         self.atomic_types = dataset_info.atomic_types
@@ -404,6 +405,7 @@ class ELECTRAFY(ModelInterface[ModelHypers]):
                 grid_shape=per_system_shapes[sys_idx],
                 n_electrons=n_elec,
                 chunk_size=self.fourier_chunk_size,
+                use_triton=self.use_triton_fourier,
             )
             density_rows.append(rho.reshape(-1))
 
