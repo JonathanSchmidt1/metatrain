@@ -87,6 +87,7 @@ mace = [
 ]
 flashmd = []
 flashmd-symplectic = []
+electrafy = []  # uses metatrain.pet modules; optional triton (bundled with torch>=2.4)
 dpa3 = [
     "deepmd-kit[torch]>=3.1.0",
     "torch>=2.7",
