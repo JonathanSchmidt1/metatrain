@@ -68,15 +68,37 @@ class ModelHypers(TypedDict):
     """Global scale factor (Angstrom^2) for Gram-factored covariance matrices."""
 
     grid_shape: List[int] = [32, 32, 32]
-    """Fixed FFT grid shape (N1, N2, N3) used for all structures.
+    """**Fallback** FFT grid shape (N1, N2, N3) used for any forward pass
+    where no per-batch override has been installed via
+    :py:meth:`ELECTRAFY.set_override_grid_shapes`.
 
-    All predicted and reference density grids are evaluated / stored at this
-    resolution.  Using a fixed shape enables standard TensorMap batching across
-    structures with different cell geometries.
+    Native-grid is the standard training path: the metatrain trainer reads
+    ``extra_data["grid_shape"]`` (emitted by
+    :class:`~metatrain.experimental.electrafy.modules.cache_dataset.CachedChgcarDataset`
+    as a TensorMap with one ``(N1, N2, N3)`` row per system) and calls
+    ``set_override_grid_shapes`` before every forward, then
+    ``clear_override_grid_shapes`` after. Under that flow this hyper is
+    never consulted -- the model uses each structure's native
+    NGXF/NGYF/NGZF.
 
-    Note: real-space resolution (Angstrom/voxel) therefore varies across
-    structures with different cell sizes.  For production, the reference
-    densities in the dataset should be resampled to this grid.
+    This fallback matters in **non-trainer code paths**:
+
+    * Ad-hoc inference (``model(systems, outputs)`` from a notebook /
+      script) when the caller forgets / doesn't need per-system grids.
+    * Unit tests that pin a small fixed grid for speed (e.g. ``[4, 4, 4]``
+      in ``tests/test_train_smoke.py``).
+    * Externally collected datasets that don't carry a ``grid_shape``
+      extra-data field.
+
+    Picking the value:
+
+    * For **training on a CHGCAR cache**: leave at any sane default; it
+      will not be used. The native grid wins.
+    * For **inference on uniform grids**: pick the resolution you want
+      every prediction to be evaluated on. Real-space resolution
+      (Angstrom/voxel) varies with cell size at fixed ``grid_shape``;
+      densities should be resampled to this grid if comparing to a
+      reference.
     """
 
     fourier_chunk_size: int = 4096

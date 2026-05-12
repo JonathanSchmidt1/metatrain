@@ -27,8 +27,39 @@ Output
 ``"charge_density"``: per-structure TensorMap.
   - Samples: system indices.
   - Properties: flattened grid points (0 … N1*N2*N3-1).
-  - Values: (n_systems, N1*N2*N3) — the density grid, in electrons/Å³.
-  - Grid shape fixed by ``ModelHypers.grid_shape`` (same for all structures).
+  - Values: ``(sum_i N1_i*N2_i*N3_i,)`` — the concatenated densities of all
+    systems in the batch. When per-system grids vary, the model also writes
+    ``self._last_density_offsets`` (prefix sum, length ``n_systems + 1``) so
+    callers can slice each structure's density back out.
+  - Grid shape: see :ref:`grid-shape-resolution`.
+
+.. _grid-shape-resolution:
+
+Grid shape resolution
+---------------------
+Two channels feed the Fourier head's output grid:
+
+1. **Per-batch override (canonical training path).** Call
+   :py:meth:`ELECTRAFY.set_override_grid_shapes` with one
+   ``(N1, N2, N3)`` per system before each forward; the model uses those
+   exact shapes for the IFFT and emits a variable-size flat output.
+
+   The metatrain trainer's ``_apply_grid_shapes`` helper does this for
+   you: it reads ``extra_data["grid_shape"]`` (a TensorMap with shape
+   ``(n_systems, 3)`` emitted by
+   :class:`~metatrain.experimental.electrafy.modules.cache_dataset.CachedChgcarDataset`)
+   and installs the override automatically before forward, then clears it
+   after.
+
+2. **Fallback hyper.** When no override is set,
+   ``ModelHypers.grid_shape`` is broadcast to every system in the batch.
+   This is the inference / smoke-test path and is the only knob without
+   which the model is not a valid module.
+
+There is no other channel: ``metatomic.torch.System`` does not carry a
+grid field, and ``model.forward(systems, outputs)`` has no per-system
+grid-shape parameter, so the stash-on-self override is the only way to
+hand per-system native grids to the Fourier head.
 
 References
 ----------
@@ -233,12 +264,19 @@ class ELECTRAFY(ModelInterface[ModelHypers]):
         self._grid_property_labels: Optional[Labels] = None
         self._n_grid = n_grid
 
-        # Per-batch grid override. When set, :meth:`forward` uses these shapes
-        # instead of ``self.grid_shape`` — one shape per system in the batch
-        # (length must equal ``len(systems)``). Set via
-        # :meth:`set_override_grid_shapes` by the training loop to match each
-        # CHGCAR's native NGXF/NGYF/NGZF. Cleared by
-        # :meth:`clear_override_grid_shapes`.
+        # Per-batch grid override -- the canonical channel for per-system
+        # native NGXF/NGYF/NGZF grids during training.
+        #
+        # ``self.grid_shape`` (the ModelHypers value) is only a fallback used
+        # when this attribute is None at forward time. The metatrain trainer's
+        # ``_apply_grid_shapes`` helper sets this from the batch's
+        # ``extra_data["grid_shape"]`` (emitted by CachedChgcarDataset) before
+        # every forward and clears it after, so the hyper is never read on the
+        # training path -- only by ad-hoc inference paths that don't supply
+        # per-batch grids.
+        #
+        # Set via :meth:`set_override_grid_shapes`, cleared via
+        # :meth:`clear_override_grid_shapes`. Length must equal ``len(systems)``.
         self._override_grid_shapes: Optional[List[Tuple[int, int, int]]] = None
 
         # Per-batch electron-count override. When set, ``forward`` uses these
@@ -256,10 +294,37 @@ class ELECTRAFY(ModelInterface[ModelHypers]):
         self._last_density_offsets: Optional[torch.Tensor] = None
 
     def set_override_grid_shapes(self, shapes: List[Tuple[int, int, int]]) -> None:
-        """Set per-system output grid shapes for the next forward call."""
+        """Install per-system output grid shapes for the next ``forward()`` call.
+
+        This is the **canonical mechanism** for handing per-system native
+        NGXF/NGYF/NGZF grids to the Fourier head. ``metatomic.torch.System``
+        has no grid field and ``forward(systems, outputs)`` has no
+        per-system grid parameter, so the only way to vary the output grid
+        across structures in a batch is via this stash-on-self override.
+
+        The override **takes precedence over** ``ModelHypers.grid_shape``
+        (the fallback). When set, the model uses ``shapes[i]`` for system
+        ``i`` and emits a concatenated flat density of total length
+        ``sum_i N1_i*N2_i*N3_i``; ``self._last_density_offsets`` is the
+        prefix sum that lets callers slice per-system densities back out.
+
+        The metatrain trainer calls this for you (see
+        ``_apply_grid_shapes`` in the trainer module) from each batch's
+        ``extra_data["grid_shape"]``. You only need to call it directly for
+        ad-hoc inference / debugging when the batch is constructed by hand.
+
+        Always pair with :py:meth:`clear_override_grid_shapes` in a
+        ``finally:`` to avoid carrying stale per-batch state into the next
+        unrelated forward.
+
+        :param shapes: One ``(N1, N2, N3)`` tuple per system in the batch
+            (must equal ``len(systems)`` at forward time).
+        """
         self._override_grid_shapes = [tuple(s) for s in shapes]  # type: ignore[assignment]
 
     def clear_override_grid_shapes(self) -> None:
+        """Drop the per-batch grid override; subsequent forwards will use
+        the ``ModelHypers.grid_shape`` fallback."""
         self._override_grid_shapes = None
 
     def set_override_n_electrons(self, n_electrons: List[float]) -> None:

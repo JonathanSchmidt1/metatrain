@@ -92,13 +92,27 @@ def _apply_grid_shapes(
     extra_data: Optional[Dict[str, Any]],
     n_systems: int,
 ) -> bool:
-    """Read per-system grid shapes from ``extra_data['grid_shape']`` and call
-    ``inner.set_override_grid_shapes(...)``. Returns ``True`` if shapes were
-    applied (caller is responsible for ``clear_override_grid_shapes`` in a
-    ``finally`` block).
+    """Hand the per-batch native NGXF/NGYF/NGZF grids to the ELECTRAFY model.
 
-    No-op if the batch has no ``grid_shape`` extra (backwards-compatible with
-    older datasets that pin a single grid via ``model.grid_shape``).
+    Reads ``extra_data["grid_shape"]`` -- a TensorMap with values of shape
+    ``(n_systems, 3)`` emitted by
+    :class:`~metatrain.experimental.electrafy.modules.cache_dataset.CachedChgcarDataset`
+    -- decodes it back into a ``List[(N1, N2, N3)]``, and installs it on
+    the model via
+    :py:meth:`~metatrain.experimental.electrafy.model.ELECTRAFY.set_override_grid_shapes`.
+
+    This is the **only channel** through which per-system native grids
+    reach the Fourier head during training -- ``System`` has no grid
+    field. The model's ``ModelHypers.grid_shape`` hyper is only a fallback
+    consulted when this override is not set (ad-hoc inference paths). On
+    the trainer's hot path, this helper is invoked before every forward
+    and ``clear_override_grid_shapes`` is invoked after, so the fallback
+    is never read.
+
+    Returns ``True`` when shapes were installed (caller MUST pair with
+    ``clear_override_grid_shapes`` in a ``finally`` block), ``False``
+    when no ``grid_shape`` extra is present (caller falls back to the
+    model's hyper -- legacy / unit-test path).
     """
     if extra_data is None or "grid_shape" not in extra_data:
         return False
