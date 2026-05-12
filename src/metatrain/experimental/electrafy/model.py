@@ -359,7 +359,10 @@ class ELECTRAFY(ModelInterface[ModelHypers]):
 
         # ---- Stages 3-4: Per-system density ----
         positions_all = torch.cat([sys.positions for sys in systems], dim=0)
-        n_gaussians_per_atom = self.zval_lookup[species] * self.gaussians_per_electron
+        # ``species`` may arrive as float (recent metatrain casts System.types
+        # to the model dtype for downstream attention plumbing); cast back to
+        # long for the integer-index lookup.
+        n_gaussians_per_atom = self.zval_lookup[species.long()] * self.gaussians_per_electron
 
         # Resolve per-system output grid shapes (paper convention: native
         # NGXF/NGYF/NGZF). When ``set_override_grid_shapes`` has been called,

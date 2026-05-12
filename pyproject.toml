@@ -181,6 +181,19 @@ filterwarnings = [
     "ignore:`torch.jit.load` is deprecated. Please switch to `torch.export`:DeprecationWarning",
     "ignore:`torch.jit.trace_method` is deprecated. Please switch to `torch.compile` or `torch.export`:DeprecationWarning",
     "ignore:`torch.jit.trace` is deprecated. Please switch to `torch.compile` or `torch.export`:DeprecationWarning",
+    # Triggered inside torch.utils.mkldnn when torch.compile is imported
+    # (electrafy/modules/fourier_density.py wraps _fourier_chunk_body in
+    # torch.compile at module load time).
+    "ignore:`torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`:DeprecationWarning",
+    # Torchinductor falls back to eager for complex ops; electrafy's
+    # Fourier head is intentionally complex-valued so this warning fires
+    # on every compile but does not actually break the model (it just
+    # disables inductor codegen for the complex part).
+    "ignore:Torchinductor does not support code generation for complex operators.*:UserWarning",
+    # Fires inside torch._dynamo.safe_has_grad when wrapping a non-leaf
+    # tensor for compile -- electrafy's Fourier chunk receives non-leaf
+    # covs (output of a chol@chol Cholesky build), which is intentional.
+    "ignore:The .grad attribute of a Tensor that is not a leaf Tensor is being accessed.*:UserWarning",
     # PyTorch does not want these, but mypy requires them
     "ignore:The TorchScript type system doesn't support instance-level annotations on empty non-base types",
     # Sphericart double backward warning
