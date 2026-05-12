@@ -197,3 +197,19 @@ class TrainerHypers(TypedDict):
     (otherwise computed as ``num_epochs * steps_per_epoch``). Use this to
     cleanly taper LR to 0 over a *partial* run (e.g. when resuming a
     crashed run to finish one more epoch with proper LR decay)."""
+
+    train_metric: Literal["rmse", "nmae"] = "rmse"
+    """Per-epoch metric printed alongside the loss and surfaced through the
+    metric logger.
+
+    * ``"rmse"`` (default, backward-compatible) -- uses
+      :class:`metatrain.utils.metrics.RMSEAccumulator`. Output key is
+      ``"{target_key} RMSE"`` (or ``"... (per atom)"``).
+    * ``"nmae"`` -- uses
+      :class:`~metatrain.experimental.electrafy.modules.metrics.NMAEAccumulator`,
+      the canonical density-prediction metric:
+      ``NMAE = sum|pred - ref| / sum|ref|``. Output key is
+      ``"{target_key} NMAE"``. Numerator and denominator are reduced across
+      ranks before forming the ratio, so the global NMAE is exact (not a
+      mean-of-ratios).
+    """

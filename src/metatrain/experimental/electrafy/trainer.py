@@ -54,6 +54,7 @@ from metatrain.utils.transfer import batch_to
 from .documentation import TrainerHypers
 from .model import ELECTRAFY
 from .modules.cache_dataset import decode_grid_shapes
+from .modules.metrics import NMAEAccumulator
 from .modules.samplers import GridBudgetBatchSampler, SortedBucketSampler
 
 
@@ -349,6 +350,23 @@ def _build_optimizer(
     )
 
 
+def _make_metric_calculator(hypers: TrainerHypers):
+    """Pick the train/val metric accumulator implied by ``hypers["train_metric"]``.
+
+    Returns an object with the ``RMSEAccumulator`` API
+    (``update(predictions, targets, extra_data)`` and
+    ``finalize(not_per_atom, is_distributed, device) -> Dict[str, float]``).
+    """
+    choice = str(hypers.get("train_metric", "rmse")).lower()
+    if choice == "rmse":
+        return RMSEAccumulator(False)
+    if choice == "nmae":
+        return NMAEAccumulator(False)
+    raise ValueError(
+        f"unknown train_metric={choice!r}; expected 'rmse' or 'nmae'"
+    )
+
+
 class Trainer(TrainerInterface[TrainerHypers]):
     __checkpoint_version__ = 1
 
@@ -580,7 +598,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 if bs is not None and hasattr(bs, "set_epoch"):
                     bs.set_epoch(epoch)
 
-            train_rmse_calculator = RMSEAccumulator(False)
+            train_rmse_calculator = _make_metric_calculator(self.hypers)
             train_loss = 0.0
 
             pbar = tqdm(train_dataloader, desc=f"Epoch {epoch}", leave=True)
@@ -655,7 +673,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
 
                 # Step-level validation
                 if global_step % val_every_n_steps == 0:
-                    val_rmse_calculator = RMSEAccumulator(False)
+                    val_rmse_calculator = _make_metric_calculator(self.hypers)
                     val_loss = 0.0
                     with torch.no_grad():
                         for val_batch in val_dataloader:
@@ -741,7 +759,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                         )
 
                     # Reset training accumulators
-                    train_rmse_calculator = RMSEAccumulator(False)
+                    train_rmse_calculator = _make_metric_calculator(self.hypers)
                     train_loss = 0.0
 
             # Epoch-level checkpointing
