@@ -225,6 +225,57 @@ def _build_train_sampler(
     return None, None
 
 
+class _CompositeOptimizer(torch.optim.Optimizer):
+    """Wrap a list of sub-optimizers so they can be driven through the same
+    ``step()`` / ``zero_grad()`` / state-dict surface the metatrain trainer
+    expects from a single optimizer.
+
+    Used for the Muon recipe: ``Muon`` on the matrix params of the PET
+    backbone + ``AdamW`` on everything else (biases, scalars, embeddings,
+    last-layer heads). Param groups from the sub-optimizers are exposed via
+    ``param_groups`` so ``LambdaLR`` can sweep the LR multiplier across all
+    groups in lockstep.
+    """
+
+    def __init__(self, optimizers: List[torch.optim.Optimizer]) -> None:
+        if not optimizers:
+            raise ValueError("_CompositeOptimizer needs at least one sub-optimizer")
+        self.optimizers = list(optimizers)
+        # Don't go through Optimizer.__init__: we hold no params ourselves; the
+        # sub-optimizers own them. Manually surface the bits the trainer reads.
+        self.defaults: Dict[str, Any] = {}
+        self.param_groups = [g for opt in self.optimizers for g in opt.param_groups]
+        self.state: Dict[Any, Any] = {}
+
+    def zero_grad(self, set_to_none: bool = True) -> None:  # type: ignore[override]
+        for opt in self.optimizers:
+            opt.zero_grad(set_to_none=set_to_none)
+
+    def step(self, closure=None):  # type: ignore[override]
+        loss = None
+        if closure is not None:
+            loss = closure()
+        for opt in self.optimizers:
+            opt.step()
+        # Re-flatten param_groups in case any sub-optimizer mutated them.
+        self.param_groups = [g for opt in self.optimizers for g in opt.param_groups]
+        return loss
+
+    def state_dict(self) -> Dict[str, Any]:  # type: ignore[override]
+        return {"sub_optimizers": [opt.state_dict() for opt in self.optimizers]}
+
+    def load_state_dict(self, sd: Dict[str, Any]) -> None:  # type: ignore[override]
+        subs = sd["sub_optimizers"]
+        if len(subs) != len(self.optimizers):
+            raise ValueError(
+                f"_CompositeOptimizer state_dict has {len(subs)} sub-optimizers "
+                f"but expected {len(self.optimizers)}"
+            )
+        for opt, sub_sd in zip(self.optimizers, subs):
+            opt.load_state_dict(sub_sd)
+        self.param_groups = [g for opt in self.optimizers for g in opt.param_groups]
+
+
 def _build_optimizer(
     model: torch.nn.Module,
     hypers: TrainerHypers,
@@ -236,9 +287,11 @@ def _build_optimizer(
     * ``"adam"`` (default) -- plain Adam with ``learning_rate``.
     * ``"adamw"`` -- AdamW with ``weight_decay`` (auto-selected when
       ``weight_decay`` is set, for backwards compatibility).
-    * ``"muon"`` -- Muon on matrix params of the PET backbone, AdamW on
-      everything else (biases, scalars, 1-D params, embeddings). Requires the
-      ``muon`` package; raises a clear error if not installed.
+    * ``"muon"`` -- ``torch.optim.Muon`` on matrix params of the PET
+      backbone, ``torch.optim.AdamW`` on everything else (biases, scalars,
+      1-D params, embeddings). Wrapped in :class:`_CompositeOptimizer` so the
+      training loop sees a single optimizer. Requires PyTorch >= 2.9 (when
+      ``torch.optim.Muon`` was added); raises a clear error otherwise.
     """
     lr = float(hypers["learning_rate"])
     wd = hypers.get("weight_decay")
@@ -257,12 +310,11 @@ def _build_optimizer(
         )
     if optimizer_choice == "muon":
         try:
-            from muon import Muon  # type: ignore[import-not-found]
+            from torch.optim import Muon  # type: ignore[attr-defined]
         except ImportError as exc:
             raise ImportError(
-                "optimizer='muon' requested but the `muon` package is not "
-                "installed. Install it (https://github.com/KellerJordan/Muon) "
-                "or use optimizer='adamw' instead."
+                "optimizer='muon' requires torch.optim.Muon (PyTorch >= 2.9); "
+                f"got torch {torch.__version__}. Use optimizer='adamw' instead."
             ) from exc
         muon_params: List[torch.nn.Parameter] = []
         adamw_params: List[torch.nn.Parameter] = []
@@ -280,13 +332,17 @@ def _build_optimizer(
             else:
                 adamw_params.append(p)
         muon_mom = float(hypers.get("muon_momentum", 0.95))
-        return Muon(
-            muon_params=muon_params,
-            adamw_params=adamw_params,
+        muon = Muon(
+            muon_params,
             lr=lr,
             momentum=muon_mom,
             weight_decay=float(wd or 0.0),
+            adjust_lr_fn="match_rms_adamw",
         )
+        adam = torch.optim.AdamW(
+            adamw_params, lr=lr, weight_decay=float(wd or 0.0)
+        )
+        return _CompositeOptimizer([muon, adam])
     raise ValueError(
         f"unknown optimizer={optimizer_choice!r}; expected "
         f"'adam', 'adamw', or 'muon'"

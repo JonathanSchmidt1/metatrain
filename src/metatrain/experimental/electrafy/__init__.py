@@ -35,6 +35,86 @@ def _register_electrafy_losses() -> None:
 _register_electrafy_losses()
 
 
+def _patch_metrics_global_keys_for_nccl() -> None:
+    """Monkey-patch :func:`metatrain.utils.metrics._get_global_keys` to use a
+    NCCL-compatible object gather.
+
+    Upstream's implementation calls ``torch.distributed.all_gather_object``,
+    which constructs CPU byte tensors. Newer PyTorch's strict-mode NCCL
+    rejects CPU collectives bound to a CUDA-backed process group with
+    ``Attempt to perform collective on tensor not on device passed to
+    init_process_group`` -- which crashes the trainer at the end of every
+    epoch when it tries to aggregate per-rank metric keys.
+
+    We replace the helper with one that pickles the local list, pushes the
+    bytes through a CUDA ``uint8`` tensor, calls plain ``all_gather`` (which
+    NCCL handles natively), and unpickles on each rank. Falls back to the
+    original ``all_gather_object`` path when the active backend is not
+    NCCL (CPU + gloo continue to work).
+
+    Idempotent.
+    """
+    import pickle
+
+    import torch
+    import torch.distributed as dist
+
+    import metatrain.utils.metrics as _mtmetrics
+
+    if getattr(_mtmetrics._get_global_keys, "_electrafy_nccl_patched", False):
+        return
+
+    def _get_global_keys_nccl(keys):
+        local_keys = list(keys)
+        world_size = dist.get_world_size()
+
+        if dist.get_backend() != "nccl":
+            gathered = [None] * world_size
+            dist.all_gather_object(gathered, local_keys)
+            union: set = set()
+            for r in gathered:
+                if r:
+                    union.update(r)
+            return sorted(union)
+
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        payload = pickle.dumps(local_keys)
+        local_size = torch.tensor([len(payload)], dtype=torch.int64, device=device)
+        sizes = [
+            torch.zeros(1, dtype=torch.int64, device=device)
+            for _ in range(world_size)
+        ]
+        dist.all_gather(sizes, local_size)
+        max_size = int(max(s.item() for s in sizes))
+
+        local_buf = torch.zeros(max_size, dtype=torch.uint8, device=device)
+        if len(payload) > 0:
+            local_buf[: len(payload)] = torch.frombuffer(
+                bytearray(payload), dtype=torch.uint8
+            ).to(device)
+        bufs = [
+            torch.empty(max_size, dtype=torch.uint8, device=device)
+            for _ in range(world_size)
+        ]
+        dist.all_gather(bufs, local_buf)
+
+        union = set()
+        for buf, sz in zip(bufs, sizes):
+            n = int(sz.item())
+            if n == 0:
+                continue
+            rank_keys = pickle.loads(bytes(buf[:n].cpu().numpy()))
+            if rank_keys:
+                union.update(rank_keys)
+        return sorted(union)
+
+    _get_global_keys_nccl._electrafy_nccl_patched = True  # type: ignore[attr-defined]
+    _mtmetrics._get_global_keys = _get_global_keys_nccl
+
+
+_patch_metrics_global_keys_for_nccl()
+
+
 __model__ = ELECTRAFY
 __trainer__ = Trainer
 
