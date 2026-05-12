@@ -65,6 +65,8 @@ def _patch_metrics_global_keys_for_nccl() -> None:
         return
 
     def _get_global_keys_nccl(keys):
+        import os
+
         local_keys = list(keys)
         world_size = dist.get_world_size()
 
@@ -77,7 +79,15 @@ def _patch_metrics_global_keys_for_nccl() -> None:
                     union.update(r)
             return sorted(union)
 
-        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        # Strict-mode NCCL requires collectives on the exact device passed to
+        # init_process_group. The trainer binds it to cuda:{local_rank} but
+        # does not call torch.cuda.set_device, so torch.cuda.current_device()
+        # still returns 0. Read LOCAL_RANK from env (set by metatrain's
+        # DistributedEnvironment._setup_distr_env from SLURM_LOCALID) and
+        # honour that.
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        device_idx = local_rank % torch.cuda.device_count()
+        device = torch.device(f"cuda:{device_idx}")
         payload = pickle.dumps(local_keys)
         local_size = torch.tensor([len(payload)], dtype=torch.int64, device=device)
         sizes = [
