@@ -54,6 +54,7 @@ from metatrain.utils.transfer import batch_to
 from .documentation import TrainerHypers
 from .model import ELECTRAFY
 from .modules.cache_dataset import decode_grid_shapes
+from .modules.samplers import GridBudgetBatchSampler, SortedBucketSampler
 
 
 # Allow Tensor.item() inside compiled regions (PET nef.py uses it for reverse
@@ -115,8 +116,16 @@ def _get_scheduler(
     train_hypers: TrainerHypers,
     steps_per_epoch: int,
 ) -> LambdaLR:
-    """Cosine-annealing LR scheduler with linear warmup."""
-    total_steps = train_hypers["num_epochs"] * steps_per_epoch
+    """Cosine-annealing LR scheduler with linear warmup.
+
+    Honours ``n_steps_override`` (use to cleanly taper LR over a partial run,
+    e.g. when finishing a crashed-then-resumed run in one extra epoch).
+    """
+    n_steps_override = int(train_hypers.get("n_steps_override", 0) or 0)
+    if n_steps_override > 0:
+        total_steps = n_steps_override
+    else:
+        total_steps = train_hypers["num_epochs"] * steps_per_epoch
     warmup_steps = int(train_hypers["warmup_fraction"] * total_steps)
 
     def lr_lambda(current_step: int) -> float:
@@ -128,6 +137,160 @@ def _get_scheduler(
         return 0.5 * (1.0 + math.cos(math.pi * progress))
 
     return LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+
+def _dataset_grid_sizes(ds) -> Optional[List[int]]:
+    """Return per-sample grid sizes for ``ds`` or ``None`` if unavailable.
+
+    Handles ``torch.utils.data.Subset`` by descending to ``.dataset`` and
+    re-indexing through ``.indices``. The base dataset must expose a
+    ``grid_sizes()`` method (duck-typed; see
+    :class:`metatrain.experimental.electrafy.modules.cache_dataset.CachedChgcarDataset`).
+    """
+    base = ds
+    indices: Optional[List[int]] = None
+    if isinstance(ds, torch.utils.data.Subset):
+        base = ds.dataset
+        indices = [int(i) for i in ds.indices]
+    if not hasattr(base, "grid_sizes"):
+        return None
+    sizes = base.grid_sizes()
+    if indices is not None:
+        sizes = [sizes[i] for i in indices]
+    return [int(s) for s in sizes]
+
+
+def _build_train_sampler(
+    ds,
+    *,
+    world_size: int,
+    rank: int,
+    use_bucketed: bool,
+    bucket_tol: float,
+    max_grid_per_batch: int,
+    is_distributed: bool,
+    seed: int,
+):
+    """Pick the right (sampler, batch_sampler) pair for a train dataset.
+
+    Returns ``(sampler, None)`` for index-style samplers and ``(None, bs)``
+    for batch samplers (``GridBudgetBatchSampler``). Either entry can also
+    be ``None`` (non-distributed default-shuffled DataLoader).
+    """
+    if max_grid_per_batch > 0 or use_bucketed:
+        grid_sizes = _dataset_grid_sizes(ds)
+        if grid_sizes is None:
+            logging.warning(
+                "use_bucketed_sampler/max_grid_points_per_batch requested but "
+                "train dataset does not expose grid_sizes(); falling back to "
+                "DistributedSampler."
+            )
+        elif max_grid_per_batch > 0:
+            bs = GridBudgetBatchSampler(
+                grid_sizes=grid_sizes,
+                world_size=world_size,
+                rank=rank,
+                max_grid_per_batch=max_grid_per_batch,
+                seed=seed,
+            )
+            logging.info(
+                f"GridBudgetBatchSampler: {bs.stats['n_batches_total']} batches "
+                f"({bs.stats['n_batches_per_rank']} per rank), "
+                f"items_min/mean/max={bs.stats['items_min']}/"
+                f"{bs.stats['items_mean']:.1f}/{bs.stats['items_max']}, "
+                f"fill_mean={bs.stats['fill_mean']:.0f}"
+            )
+            return None, bs
+        else:
+            s = SortedBucketSampler(
+                grid_sizes=grid_sizes,
+                world_size=world_size,
+                rank=rank,
+                seed=seed,
+                tol=bucket_tol,
+            )
+            logging.info(
+                f"SortedBucketSampler: tol={bucket_tol}, "
+                f"{len(s)} steps per rank from {len(grid_sizes)} samples"
+            )
+            return s, None
+    if is_distributed:
+        return (
+            DistributedSampler(
+                ds, num_replicas=world_size, rank=rank,
+                shuffle=True, drop_last=True,
+            ),
+            None,
+        )
+    return None, None
+
+
+def _build_optimizer(
+    model: torch.nn.Module,
+    hypers: TrainerHypers,
+) -> torch.optim.Optimizer:
+    """Build the optimizer per ``hypers["optimizer"]``.
+
+    Choices:
+
+    * ``"adam"`` (default) -- plain Adam with ``learning_rate``.
+    * ``"adamw"`` -- AdamW with ``weight_decay`` (auto-selected when
+      ``weight_decay`` is set, for backwards compatibility).
+    * ``"muon"`` -- Muon on matrix params of the PET backbone, AdamW on
+      everything else (biases, scalars, 1-D params, embeddings). Requires the
+      ``muon`` package; raises a clear error if not installed.
+    """
+    lr = float(hypers["learning_rate"])
+    wd = hypers.get("weight_decay")
+    optimizer_choice = str(hypers.get("optimizer", "adam")).lower()
+
+    # Backwards compat: weight_decay set on a default ("adam") config selects
+    # AdamW (the previous behavior).
+    if optimizer_choice == "adam" and wd is not None:
+        optimizer_choice = "adamw"
+
+    if optimizer_choice == "adam":
+        return torch.optim.Adam(model.parameters(), lr=lr)
+    if optimizer_choice == "adamw":
+        return torch.optim.AdamW(
+            model.parameters(), lr=lr, weight_decay=float(wd or 0.0)
+        )
+    if optimizer_choice == "muon":
+        try:
+            from muon import Muon  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise ImportError(
+                "optimizer='muon' requested but the `muon` package is not "
+                "installed. Install it (https://github.com/KellerJordan/Muon) "
+                "or use optimizer='adamw' instead."
+            ) from exc
+        muon_params: List[torch.nn.Parameter] = []
+        adamw_params: List[torch.nn.Parameter] = []
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            # Same convention as the muon-branch PET trainer + the standalone
+            # kuma/train_mp_streaming.py: 2-D+ parameters of the GNN backbone
+            # go to Muon; biases, scalars, embeddings, last-layer heads go to
+            # AdamW.
+            is_matrix = p.ndim >= 2
+            is_embedding = "embed" in name.lower() or "embedding" in name.lower()
+            if is_matrix and not is_embedding:
+                muon_params.append(p)
+            else:
+                adamw_params.append(p)
+        muon_mom = float(hypers.get("muon_momentum", 0.95))
+        return Muon(
+            muon_params=muon_params,
+            adamw_params=adamw_params,
+            lr=lr,
+            momentum=muon_mom,
+            weight_decay=float(wd or 0.0),
+        )
+    raise ValueError(
+        f"unknown optimizer={optimizer_choice!r}; expected "
+        f"'adam', 'adamw', or 'muon'"
+    )
 
 
 class Trainer(TrainerInterface[TrainerHypers]):
@@ -183,14 +346,15 @@ class Trainer(TrainerInterface[TrainerHypers]):
 
         logging.info("Setting up data loaders")
 
+        use_bucketed = bool(self.hypers.get("use_bucketed_sampler", False))
+        max_grid_per_batch = int(self.hypers.get("max_grid_points_per_batch", 0) or 0)
+        bucket_tol = float(self.hypers.get("bucket_tol", 0.10))
+        sampler_world_size = world_size if is_distributed else 1
+        sampler_rank = rank
+
+        # Validation always uses the standard (deterministic) sampler -- size
+        # imbalance during a one-pass eval doesn't matter for throughput.
         if is_distributed:
-            train_samplers = [
-                DistributedSampler(
-                    ds, num_replicas=world_size, rank=rank,
-                    shuffle=True, drop_last=True,
-                )
-                for ds in train_datasets
-            ]
             val_samplers = [
                 DistributedSampler(
                     ds, num_replicas=world_size, rank=rank,
@@ -199,8 +363,23 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 for ds in val_datasets
             ]
         else:
-            train_samplers = [None] * len(train_datasets)
             val_samplers = [None] * len(val_datasets)
+
+        train_samplers: List[Any] = []
+        train_batch_samplers: List[Any] = []
+        for ds in train_datasets:
+            sampler, batch_sampler = _build_train_sampler(
+                ds,
+                world_size=sampler_world_size,
+                rank=sampler_rank,
+                use_bucketed=use_bucketed,
+                bucket_tol=bucket_tol,
+                max_grid_per_batch=max_grid_per_batch,
+                is_distributed=is_distributed,
+                seed=int(self.hypers.get("distributed_port", 0)),
+            )
+            train_samplers.append(sampler)
+            train_batch_samplers.append(batch_sampler)
 
         # Collate functions — only neighbor lists, no additive/scaler transforms
         dataset_info = model.dataset_info
@@ -231,23 +410,35 @@ class Trainer(TrainerInterface[TrainerHypers]):
         # Training dataloaders
         batch_size = self.hypers["batch_size"]
         train_dataloaders = []
-        for ds, sampler in zip(train_datasets, train_samplers, strict=True):
-            if len(ds) < batch_size:
+        for ds, sampler, batch_sampler in zip(
+            train_datasets, train_samplers, train_batch_samplers, strict=True
+        ):
+            if batch_sampler is None and len(ds) < batch_size:
                 raise ValueError(
                     f"Training dataset has fewer samples ({len(ds)}) "
                     f"than batch size ({batch_size}). Reduce batch_size."
                 )
-            train_dataloaders.append(
-                DataLoader(
-                    dataset=ds,
-                    batch_size=batch_size,
-                    sampler=sampler,
-                    shuffle=(sampler is None),
-                    drop_last=(sampler is None),
-                    collate_fn=collate_fn_train,
-                    num_workers=num_workers,
+            if batch_sampler is not None:
+                train_dataloaders.append(
+                    DataLoader(
+                        dataset=ds,
+                        batch_sampler=batch_sampler,
+                        collate_fn=collate_fn_train,
+                        num_workers=num_workers,
+                    )
                 )
-            )
+            else:
+                train_dataloaders.append(
+                    DataLoader(
+                        dataset=ds,
+                        batch_size=batch_size,
+                        sampler=sampler,
+                        shuffle=(sampler is None),
+                        drop_last=(sampler is None),
+                        collate_fn=collate_fn_train,
+                        num_workers=num_workers,
+                    )
+                )
         train_dataloader = CombinedDataLoader(train_dataloaders, shuffle=True)
 
         # Validation dataloaders
@@ -286,16 +477,13 @@ class Trainer(TrainerInterface[TrainerHypers]):
         )
 
         # Optimizer
-        if self.hypers.get("weight_decay") is not None:
-            optimizer = torch.optim.AdamW(
-                model.parameters(),
-                lr=self.hypers["learning_rate"],
-                weight_decay=self.hypers["weight_decay"],
-            )
-        else:
-            optimizer = torch.optim.Adam(
-                model.parameters(), lr=self.hypers["learning_rate"]
-            )
+        optimizer = _build_optimizer(model, self.hypers)
+        logging.info(
+            f"Optimizer: {type(optimizer).__name__} "
+            f"(choice={self.hypers.get('optimizer', 'adam')!r}, "
+            f"lr={self.hypers['learning_rate']}, "
+            f"weight_decay={self.hypers.get('weight_decay')})"
+        )
 
         if self.optimizer_state_dict is not None:
             optimizer.load_state_dict(self.optimizer_state_dict)
@@ -326,9 +514,15 @@ class Trainer(TrainerInterface[TrainerHypers]):
 
         epoch = start_epoch
         for epoch in range(start_epoch, self.hypers["num_epochs"]):
-            if is_distributed:
-                for sampler in train_samplers:
+            # Reseed per-epoch shuffling. Distributed + bucketed/grid-budget
+            # samplers all expose set_epoch; for single-rank with no sampler
+            # the DataLoader's shuffle=True default handles it.
+            for sampler in train_samplers:
+                if sampler is not None and hasattr(sampler, "set_epoch"):
                     sampler.set_epoch(epoch)
+            for bs in train_batch_samplers:
+                if bs is not None and hasattr(bs, "set_epoch"):
+                    bs.set_epoch(epoch)
 
             train_rmse_calculator = RMSEAccumulator(False)
             train_loss = 0.0

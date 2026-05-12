@@ -33,9 +33,10 @@ the same way it batches targets.
 
 from __future__ import annotations
 
+import json
 from collections import namedtuple
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -182,6 +183,43 @@ class CachedChgcarDataset(torch.utils.data.Dataset):
         target = density_to_single_sample_tmap(flat, sample_index=idx)
         grid_shape = _grid_shape_tmap(shape, sample_index=idx, dtype=self.dtype)
         return self._sample_class(system=system, charge_density=target, grid_shape=grid_shape)
+
+    def grid_sizes(self) -> List[int]:
+        """Per-sample grid point count (``N1 * N2 * N3``) in dataset index order.
+
+        Used by :class:`~metatrain.experimental.electrafy.modules.samplers.SortedBucketSampler`
+        and :class:`~metatrain.experimental.electrafy.modules.samplers.GridBudgetBatchSampler`
+        to group same-size structures into the same DDP step.
+
+        Reads ``<cache_root>/_shapes.json`` (a precomputed index produced by
+        ``perf/build_shape_index.py``). Falls back to per-file ``torch.load``
+        if the index is unavailable -- expensive on large datasets (~25 min for
+        15k files), so prebuild the index for production use.
+        """
+        if not self.paths:
+            return []
+        cache_root = self.paths[0].parent
+        index_path = cache_root / "_shapes.json"
+        if index_path.is_file():
+            with open(index_path) as f:
+                idx: Dict[str, Sequence[int]] = json.load(f)
+            missing = [p.name for p in self.paths if p.name not in idx]
+            if missing:
+                raise RuntimeError(
+                    f"_shapes.json at {index_path} is missing entries for "
+                    f"{len(missing)} paths (first: {missing[:3]}). "
+                    f"Rebuild the index with perf/build_shape_index.py."
+                )
+            return [
+                int(idx[p.name][0]) * int(idx[p.name][1]) * int(idx[p.name][2])
+                for p in self.paths
+            ]
+        out: List[int] = []
+        for p in self.paths:
+            rec = torch.load(p, map_location="cpu", weights_only=False)
+            sh = rec["shape"]
+            out.append(int(sh[0]) * int(sh[1]) * int(sh[2]))
+        return out
 
 
 def scan_atomic_types(

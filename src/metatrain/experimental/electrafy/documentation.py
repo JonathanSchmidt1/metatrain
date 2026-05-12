@@ -153,3 +153,47 @@ class TrainerHypers(TypedDict):
     The default ``"nmae"`` (Normalized Mean Absolute Error) matches the
     ELECTRAFY paper loss:  L = integral|pred - ref| / integral|ref|.
     """
+
+    optimizer: Literal["adam", "adamw", "muon"] = "adam"
+    """Optimizer family. ``"muon"`` uses
+    `Moonshot's Muon <https://github.com/KellerJordan/Muon>`_ on the matrix
+    parameters of the PET backbone (with AdamW on biases / scalars / 1-D
+    parameters), matching the convention used in metatrain's PET muon branch.
+    Falls back to AdamW with a clear error if the ``muon`` package is not
+    installed."""
+
+    muon_momentum: float = 0.95
+    """Muon momentum (``mu``). Ignored when ``optimizer != "muon"``."""
+
+    use_bucketed_sampler: bool = False
+    """Replace the default ``DistributedSampler`` with a size-aware sampler
+    that groups same-grid-size structures into the same DDP step. Requires
+    the train dataset to expose a ``grid_sizes()`` method (e.g.
+    :class:`~metatrain.experimental.electrafy.modules.cache_dataset.CachedChgcarDataset`).
+
+    On 2x4 H100 with the MP-CHGCAR corpus (~200k-2M voxels per system) this
+    delivered 1.64x e2e speedup (bench 3348578) vs random
+    ``DistributedSampler`` because variable system sizes no longer gate the
+    max-rank DDP step."""
+
+    bucket_tol: float = 0.10
+    """Max within-step grid-size spread for the bucketed sampler
+    (``max_grid / min_grid <= 1 + bucket_tol``). ``0.0`` = strict mode
+    (consecutive sorted indices); larger values relax the spread and
+    reshuffle within-pool each epoch. Ignored when
+    ``use_bucketed_sampler`` is ``False``."""
+
+    max_grid_points_per_batch: int = 0
+    """If ``> 0``, use the grid-budget batch sampler instead of fixed
+    ``batch_size`` (and instead of the bucketed sampler if both are set).
+    Greedy-packs structures into batches whose total grid-point count does
+    not exceed this budget, then assigns batches to ranks by stride.
+
+    Ignored when ``0``. Useful when memory rather than count is the binding
+    constraint (variable-grid datasets)."""
+
+    n_steps_override: int = 0
+    """If ``> 0``, override the cosine-LR scheduler's total step count
+    (otherwise computed as ``num_epochs * steps_per_epoch``). Use this to
+    cleanly taper LR to 0 over a *partial* run (e.g. when resuming a
+    crashed run to finish one more epoch with proper LR decay)."""
